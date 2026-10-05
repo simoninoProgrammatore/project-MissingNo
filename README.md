@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="Project MissingNo banner: a glitching pixel emblem over a duel between two original creatures" width="100%">
+  <img src="docs/assets/banner.svg" alt="Project MissingNo banner: a glitching pixel emblem over a top-down pixel-art region" width="100%">
 </p>
 
 <h1 align="center">Project MissingNo</h1>
