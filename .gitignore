@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Esperimenti e artefatti
+wandb/
+traces/*
+!traces/.gitkeep
+checkpoints_models/
+*.pt
+*.safetensors
+
+# ROM e salvataggi: mai su git (le ROM non si possono condividere)
+*.gb
+*.gbc
+*.gba
+*.sav
+
+# Server Showdown clonato in locale
+pokemon-showdown/
+
+.DS_Store
