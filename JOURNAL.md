@@ -1,22 +1,23 @@
-# Diario di MissingNo
+# Project MissingNo — Journal
 
-*Una voce per sessione: cosa ho provato, cosa è successo, cosa ho imparato, prossimo passo.*
+*One entry per session: what I tried, what happened, what I learned, what's next.*
 
 ---
 
-## AAAA-MM-GG — Fase 0: setup
+## YYYY-MM-DD — Phase 0: setup
 
-**Fatto:**
-- Creato il workspace uv con `core`, `envs`, `skills/battle`.
-- Server Showdown locale funzionante.
-- Agente euristico (mossa con danno atteso più alto) contro casuale: 30/30 in gen1randombattle.
+**Done:**
+- Created the uv workspace with `core`, `envs` and `skills/battle`.
+- Local Pokémon Showdown server running.
+- Rule-based player (always picks the move with the highest expected damage) against a random player: 30/30 in gen1randombattle.
 
-**Imparato:**
+**Learned:**
 - 
 
-**Problemi:**
+**Problems:**
 - 
 
-**Prossimo passo:**
-- Scaricare i dati di lotte umane di Metamon e capirne il formato.
-- Scrivere la codifica dello stato di lotta.
+**Next:**
+- Study the existing literature and projects.
+- Improve the rule-based player with real game knowledge (status moves, switching, Gen 1 quirks).
+- Look at the human battle datasets released by the Metamon project and understand their format.

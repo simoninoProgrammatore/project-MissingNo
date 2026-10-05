@@ -1,14 +1,14 @@
-# Punti difficili
+# Hard spots
 
-Savestate nei momenti in cui un agente tipicamente si blocca. Per ognuno:
+Save states placed at moments where an AI player (or a human) commonly gets stuck. For each one:
 
-| Campo | Esempio |
+| Field | Example |
 |---|---|
 | `id` | `red_001_old_man` |
-| `gioco` | red |
-| `savestate` | `red_001_old_man.state` (non versionato se contiene dati della ROM) |
-| `situazione` | Il vecchio blocca la strada a nord di Smeraldopoli finché non si consegna il pacco al Prof. Oak |
-| `successo` | L'agente raggiunge la Strada 2 |
-| `passi massimi` | 5000 |
+| `game` | red |
+| `savestate` | `red_001_old_man.state` (not versioned if it contains game data) |
+| `situation` | The old man blocks the path north of Viridian City until Oak's Parcel is delivered |
+| `success` | The player reaches Route 2 |
+| `max steps` | 5000 |
 
-Ogni punto diventa anche un test automatico: carica lo stato, fai girare l'agente per N passi, verifica il criterio di successo.
+Each hard spot also becomes an automated test: load the state, let the player run for N steps, check the success criterion.
