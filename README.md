@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="Project MissingNo banner: a monochrome pixel question mark with a single glitch" width="100%">
+  <img src="docs/assets/banner.svg" alt="Project MissingNo banner: a heavily glitched pixel question mark" width="100%">
 </p>
 
 <h1 align="center">Project MissingNo</h1>
