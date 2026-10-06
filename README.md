@@ -36,31 +36,28 @@ What is still missing is a small, open AI that plays these games well in a gener
 
 ## Where we are
 
-**Right now, we are studying.** There is no final design yet, and that is on purpose. Before building the full system, the most important thing is to understand what has been tried, what worked, and why.
+**Phase 1: prototype.** The main choices are made:
 
-Some of the big questions we are exploring:
+- **One agent that learns everything by itself.** It only sees the screen and presses buttons, like a player would.
+- **No help from outside.** It never watches humans play and never gets walkthrough knowledge. It can know what a game's instruction booklet would tell you, but not what a strategy guide would.
+- **The same rules for every game.** It is rewarded for generic progress (discovering new places, earning badges, growing its team), never for game-specific events.
+- **Tested on games it has never seen.** After learning on some games, it will be dropped into others to see what carries over.
 
-- **One big brain, or a team of specialists?** Should a single AI learn everything, or should there be separate "experts" for battling and for exploring, coordinated by a kind of coach?
-- **How should it learn?** By watching millions of battles played by humans, by playing against itself, or both?
-- **What should it see?** Should it read the game's internal memory, or look only at the screen, like a human does?
-- **How do we know it is getting better?** One idea is a collection of "hard spots": moments in the games where players and AIs commonly get stuck, carefully chosen by someone who knows the games well, used as a test.
-
-The first experiments will focus on **battles**, the most self-contained part of the game and a good place to learn the basics. A simple rule-based battler already exists as a starting point to beat.
+The game environment is built and tested. The next step is the first round of learning experiments on the opening of Pokémon Red, from the bedroom to Viridian City, comparing different ways of exploring.
 
 ## The road ahead
 
-1. **Study** what others have done and learn the fundamentals.
-2. **Battles:** train a first AI that battles better than simple rules.
-3. **Exploring the world:** teach an AI to move around and reach places on the map.
-4. **Putting it together:** combine everything into a player that makes progress through the story.
-5. **Beyond:** try it on a different Pokémon game and see what carries over.
+1. **Prototype:** find out which way of exploring makes learning from scratch possible.
+2. **One game:** see how far the agent gets in Pokémon Red.
+3. **Several games:** train on a few games and test on others it has never seen.
+4. **Full games:** an agent that can finish them.
 
-There are no fixed deadlines. This is a learning project, and the order matters more than the speed.
+Each step is designed to be useful on its own, even if the next one turns out harder than expected.
 
 ## Follow along
 
 - 📓 [Journal](JOURNAL.md): what was tried, what broke, what was learned
-- 🗺️ [Working plan](docs/plan.md): the current, evolving plan (a draft, not a final design)
+- 🔬 [Research design](docs/research.md): the questions, hypotheses and experiments behind the project
 - 🛠️ [Setup](docs/SETUP.md): for anyone who wants to run the code
 
 ## Disclaimer
