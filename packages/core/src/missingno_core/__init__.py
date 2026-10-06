@@ -1,9 +1,10 @@
-"""Contratti condivisi di MissingNo.
+"""Shared types of Project MissingNo.
 
-Tutto ciò che sta sopra gli adattatori di gioco dipende solo da questi tipi,
-mai dalla RAM o da dettagli di un gioco specifico.
+Everything above the game adapters depends only on these types, never on the
+memory layout or other details of a specific game.
 """
 
+from missingno_core.progress import ProgressSignals
 from missingno_core.types import (
     Action,
     BattleChoice,
@@ -28,6 +29,7 @@ __all__ = [
     "Goal",
     "GoalKind",
     "PokemonInfo",
+    "ProgressSignals",
     "Skill",
     "SkillStatus",
 ]

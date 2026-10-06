@@ -6,7 +6,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 
-# Esperimenti e artefatti
+# Experiments and artifacts
 wandb/
 traces/*
 !traces/.gitkeep
@@ -14,13 +14,19 @@ checkpoints_models/
 *.pt
 *.safetensors
 
-# ROM e salvataggi: mai su git (le ROM non si possono condividere)
+# ROMs and save states: never on git (ROMs cannot be shared)
 *.gb
 *.gbc
 *.gba
 *.sav
+*.state
+*.ram
+roms/*
+!roms/README.md
+states/*
+!states/README.md
 
-# Server Showdown clonato in locale
+# Local Showdown server (archived battle exercise)
 pokemon-showdown/
 
 .DS_Store

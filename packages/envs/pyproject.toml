@@ -1,12 +1,19 @@
 [project]
 name = "missingno-envs"
 version = "0.1.0"
-description = "Ambienti: Pokémon Showdown (lotte) e, più avanti, PyBoy (gioco di ruolo)."
+description = "Gymnasium environments: Pokémon games running in an emulator, observed from the screen."
 requires-python = ">=3.12"
-dependencies = ["missingno-core", "poke-env>=0.8"]
+dependencies = [
+    "gymnasium>=1.0",
+    "missingno-core",
+    "missingno-games",
+    "numpy>=2.0",
+    "pyboy>=2.6",
+]
 
 [tool.uv.sources]
 missingno-core = { workspace = true }
+missingno-games = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

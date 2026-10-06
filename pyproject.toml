@@ -1,30 +1,29 @@
 [project]
 name = "missingno"
 version = "0.1.0"
-description = "Agente orchestrato che gioca a Pokémon, con modelli piccoli addestrati da zero."
+description = "An end-to-end agent that learns to play Pokémon games from the screen, from scratch."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "missingno-core",
+    "missingno-games",
     "missingno-envs",
-    "missingno-battle",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "pre-commit>=4",
 ]
 
 [tool.uv.workspace]
-members = ["packages/core", "packages/envs", "packages/skills/*"]
+members = ["packages/core", "packages/games", "packages/envs"]
 
 [tool.uv.sources]
 missingno-core = { workspace = true }
+missingno-games = { workspace = true }
 missingno-envs = { workspace = true }
-missingno-battle = { workspace = true }
 
 [tool.ruff]
 line-length = 100
@@ -32,7 +31,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]  # long lines are left to the formatter
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"

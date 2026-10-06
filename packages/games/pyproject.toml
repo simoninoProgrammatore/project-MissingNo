@@ -1,0 +1,16 @@
+[project]
+name = "missingno-games"
+version = "0.1.0"
+description = "Game adapters: read progress signals from each game's memory, used only to compute rewards."
+requires-python = ">=3.12"
+dependencies = ["missingno-core"]
+
+[tool.uv.sources]
+missingno-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/missingno_games"]
