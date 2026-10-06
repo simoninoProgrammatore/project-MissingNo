@@ -14,6 +14,7 @@ import pytest
 from gymnasium.utils.env_checker import check_env
 from missingno_core import ProgressSignals
 from missingno_envs import EnvConfig, PokemonEnv
+from missingno_games import Milestone
 
 TEST_ROM = os.path.join(os.path.dirname(pyboy.__file__), "default_rom.gb")
 
@@ -22,6 +23,10 @@ class ScriptedAdapter:
     """Returns a predefined sequence of progress signals, one per read."""
 
     name = "test"
+    milestones = (
+        Milestone("T1", "Reach map 1", lambda s: s.map_id == 1),
+        Milestone("T2", "Earn a badge", lambda s: s.badges > 0),
+    )
 
     def __init__(self, sequence):
         self.sequence = list(sequence)
@@ -90,3 +95,23 @@ def test_truncation_at_max_steps():
 def test_missing_rom_has_a_clear_error(tmp_path):
     with pytest.raises(FileNotFoundError, match="roms/"):
         PokemonEnv(EnvConfig(rom_path=str(tmp_path / "nope.gb")), ScriptedAdapter([]))
+
+
+def test_milestones_record_first_step_reached():
+    seq = [
+        ProgressSignals(map_id=0, x=0, y=0),  # reset
+        ProgressSignals(map_id=0, x=1, y=0),  # step 1
+        ProgressSignals(map_id=1, x=0, y=0),  # step 2: T1
+        ProgressSignals(map_id=0, x=0, y=0),  # step 3: left map 1, T1 stays reached
+        ProgressSignals(map_id=0, x=0, y=0, badges=1),  # step 4: T2
+    ]
+    env = make_env(seq)
+    env.reset(seed=0)
+    for _ in range(4):
+        *_, info = env.step(0)
+    assert info["milestone_step"].tolist() == [2, 4]
+    # New episode: milestones are reset and re-checked on the starting state
+    # (the scripted adapter now returns a state that already has a badge).
+    _, info = env.reset(seed=0)
+    assert info["milestone_step"].tolist() == [-1, 0]
+    env.close()

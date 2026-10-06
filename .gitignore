@@ -30,3 +30,6 @@ states/*
 pokemon-showdown/
 
 .DS_Store
+
+# Training runs (TensorBoard logs and checkpoints)
+runs/

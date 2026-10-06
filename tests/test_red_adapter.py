@@ -37,3 +37,13 @@ def test_party_count_is_clamped():
     mem = FakeMemory()
     mem[R.PARTY_COUNT] = 0xFF  # garbage during the intro
     assert len(RedAdapter().read(mem).party_levels) == 6
+
+
+def test_phase1_milestones():
+    from missingno_core import ProgressSignals
+
+    reached = lambda **kw: [m.id for m in R.MILESTONES if m.reached(ProgressSignals(**kw))]  # noqa: E731
+    assert reached(map_id=R.REDS_HOUSE_2F, x=0, y=0) == []
+    assert reached(map_id=R.REDS_HOUSE_1F, x=0, y=0) == ["M1"]
+    assert reached(map_id=R.OAKS_LAB, x=0, y=0, party_levels=(5,)) == ["M3", "M4"]
+    assert reached(map_id=R.VIRIDIAN_CITY, x=0, y=0, party_levels=(6,)) == ["M4", "M6"]

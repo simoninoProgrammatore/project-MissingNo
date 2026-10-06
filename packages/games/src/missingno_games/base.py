@@ -4,6 +4,8 @@ from typing import Protocol, SupportsIndex
 
 from missingno_core import ProgressSignals
 
+from missingno_games.milestones import Milestone
+
 
 class Memory(Protocol):
     """Anything indexable by address returning a byte, like `pyboy.memory`."""
@@ -22,5 +24,7 @@ class GameAdapter(Protocol):
     name: str
     #: SHA-1 of the expected ROM, to warn if a different version is used.
     rom_sha1: str
+    #: Checkpoints used only for evaluation, never for rewards.
+    milestones: tuple[Milestone, ...]
 
     def read(self, memory: Memory) -> ProgressSignals: ...

@@ -8,6 +8,7 @@ dependencies = [
     "missingno-core",
     "missingno-games",
     "missingno-envs",
+    "missingno-agents",
 ]
 
 [dependency-groups]
@@ -18,12 +19,13 @@ dev = [
 ]
 
 [tool.uv.workspace]
-members = ["packages/core", "packages/games", "packages/envs"]
+members = ["packages/core", "packages/games", "packages/envs", "packages/agents"]
 
 [tool.uv.sources]
 missingno-core = { workspace = true }
 missingno-games = { workspace = true }
 missingno-envs = { workspace = true }
+missingno-agents = { workspace = true }
 
 [tool.ruff]
 line-length = 100

@@ -93,6 +93,8 @@ class PokemonEnv(gym.Env):
         self._best_badges = 0
         self._best_total_level = 0
         self._steps = 0
+        # Step at which each milestone was first reached in this episode (-1 = not yet).
+        self._milestone_step = np.full(len(adapter.milestones), -1, dtype=np.int64)
 
     # ------------------------------------------------------------------ API
 
@@ -107,6 +109,8 @@ class PokemonEnv(gym.Env):
         self._best_badges = signals.badges
         self._best_total_level = signals.total_level
         self._steps = 0
+        self._milestone_step[:] = -1
+        self._update_milestones(signals)
 
         frame = self._grab_frame()
         self._frames.clear()
@@ -125,6 +129,7 @@ class PokemonEnv(gym.Env):
 
         signals = self.adapter.read(self.pyboy.memory)
         reward, parts = self._reward(signals)
+        self._update_milestones(signals)
         self._frames.append(self._grab_frame())
 
         terminated = False  # Pokémon has no "game over": only time limits
@@ -160,6 +165,11 @@ class PokemonEnv(gym.Env):
             self._best_total_level = s.total_level
         return sum(parts.values()), parts
 
+    def _update_milestones(self, s: ProgressSignals) -> None:
+        for i, milestone in enumerate(self.adapter.milestones):
+            if self._milestone_step[i] < 0 and milestone.reached(s):
+                self._milestone_step[i] = self._steps
+
     def _grab_frame(self) -> np.ndarray:
         rgb = self.pyboy.screen.ndarray[:, :, :3].astype(np.uint16)
         gray = (77 * rgb[..., 0] + 150 * rgb[..., 1] + 29 * rgb[..., 2]) >> 8
@@ -180,6 +190,7 @@ class PokemonEnv(gym.Env):
             "maps_visited": len(self._visited_maps),
             "reward_parts": parts,
             "steps": self._steps,
+            "milestone_step": self._milestone_step.copy(),
         }
 
 

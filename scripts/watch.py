@@ -1,11 +1,12 @@
-"""Watch an agent play in a window. For now: a random agent.
+"""Watch an agent play in a window: a random agent, or a trained one.
 
 It is also the first sanity check of the environment: you should see the player
 move, and the reward should grow when it reaches new tiles or maps.
 
 Usage:
-    uv run python scripts/watch.py --steps 2000
-    uv run python scripts/watch.py --speed 0      # as fast as possible
+    uv run python scripts/watch.py --steps 2000                                  # random agent
+    uv run python scripts/watch.py --checkpoint runs/ppo_s1/checkpoints/latest.pt
+    uv run python scripts/watch.py --checkpoint ... --greedy --speed 0           # best action, max speed
 """
 
 import argparse
@@ -15,17 +16,47 @@ from missingno_envs import ACTIONS, EnvConfig, PokemonEnv
 from missingno_games import ADAPTERS
 
 
-def main(game: str, rom: str, state: str | None, steps: int, speed: int) -> None:
-    config = EnvConfig(rom_path=rom, start_state_path=state, max_steps=steps)
-    env = PokemonEnv(config, ADAPTERS[game](), render_mode="human", emulation_speed=speed)
-    _, info = env.reset(seed=0)
+def load_policy(checkpoint: str, greedy: bool):
+    import torch
+    from missingno_agents import CnnActorCritic
+
+    data = torch.load(checkpoint, map_location="cpu")
+    agent = CnnActorCritic(tuple(data["obs_shape"]), data["n_actions"])
+    agent.load_state_dict(data["model"])
+    agent.eval()
+
+    def policy(obs):
+        with torch.no_grad():
+            action, *_ = agent.act(torch.as_tensor(obs).unsqueeze(0), greedy=greedy)
+        return int(action.item())
+
+    return policy
+
+
+def main(args) -> None:
+    config = EnvConfig(rom_path=args.rom, start_state_path=args.state, max_steps=args.steps)
+    env = PokemonEnv(
+        config,
+        ADAPTERS[args.game](),
+        render_mode=None if args.no_window else "human",
+        emulation_speed=args.speed,
+    )
+    policy = load_policy(args.checkpoint, args.greedy) if args.checkpoint else None
+    milestones = env.adapter.milestones
+
+    obs, info = env.reset(seed=0)
     total = 0.0
-    for step in range(1, steps + 1):
-        action = env.action_space.sample()
-        _, reward, terminated, truncated, info = env.step(action)
+    reached = set()
+    for step in range(1, args.steps + 1):
+        action = policy(obs) if policy else env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
         total += reward
-        if info["reward_parts"]:
+        if args.verbose and info["reward_parts"]:
             print(f"step {step:5d}  {ACTIONS[action]:>5}  +{reward:.2f}  {info['reward_parts']}")
+        for m, at in zip(milestones, info["milestone_step"], strict=True):
+            if at >= 0 and m.id not in reached:
+                reached.add(m.id)
+                print(f"*** step {step:5d}: {m.id} {m.name}")
         if step % 500 == 0:
             print(
                 f"--- step {step}: return {total:.2f}, tiles {info['tiles_visited']}, "
@@ -36,6 +67,7 @@ def main(game: str, rom: str, state: str | None, steps: int, speed: int) -> None
     print(
         f"Episode return: {total:.2f}  tiles: {info['tiles_visited']}  maps: {info['maps_visited']}"
     )
+    print(f"Milestones reached: {len(reached)}/{len(milestones)}")
     env.close()
 
 
@@ -48,8 +80,12 @@ if __name__ == "__main__":
     parser.add_argument("--state", default="states/red_start.state")
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--speed", type=int, default=4, help="1 = real time, 0 = unlimited")
+    parser.add_argument("--checkpoint", help="trained model (.pt); omit for a random agent")
+    parser.add_argument("--greedy", action="store_true", help="always pick the most likely button")
+    parser.add_argument("--verbose", action="store_true", help="print every reward")
+    parser.add_argument("--no-window", action="store_true", help="run without a window")
     args = parser.parse_args()
-    state = args.state if Path(args.state).exists() else None
-    if state is None:
+    if not Path(args.state).exists():
         print(f"No start state at {args.state}: booting from power-on.")
-    main(args.game, args.rom, state, args.steps, args.speed)
+        args.state = None
+    main(args)

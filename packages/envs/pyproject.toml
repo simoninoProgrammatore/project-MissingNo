@@ -9,6 +9,7 @@ dependencies = [
     "missingno-games",
     "numpy>=2.0",
     "pyboy>=2.6",
+    "tensorboard>=2.21.0",
 ]
 
 [tool.uv.sources]
