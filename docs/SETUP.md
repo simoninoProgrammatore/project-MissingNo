@@ -4,7 +4,7 @@ Technical instructions for running the code. The project is in an early phase, s
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/) (Python package and project manager; it installs Python 3.12 if missing)
+- [uv](https://docs.astral.sh/uv/) (Python package and project manager; it installs Python if missing). Python 3.11 or newer.
 - Git
 - A **legally obtained** Pokémon Red ROM, dumped from your own cartridge
 
@@ -63,6 +63,18 @@ What to look at in TensorBoard:
 
 PyTorch from PyPI runs on the CPU on Windows, which is fine for this small network. A GPU is optional.
 
+### Long runs
+
+- **Resume** a run from its last checkpoint: `--resume runs/<run-name>/checkpoints/latest.pt` (keep the same `--run-name`).
+- **Stop cleanly** after a number of hours, saving everything: `--time-limit-hours 11`.
+- `Ctrl+C` also saves the last complete update.
+
+### Kaggle
+
+`notebooks/kaggle_train.ipynb` runs training on Kaggle (GPU for learning, CPU cores for the emulators). Upload it to Kaggle, then follow the instructions in its first cell: enable GPU and Internet, add a **private** dataset with `pokemon_red.gb` and `red_start.state`, and use *Save Version → Save & Run All* for long runs. To continue a run in a new session, add the previous version's output as input and set `RESUME = True`.
+
+On a laptop the emulators may not scale well across cores (run `scripts/diagnose_speed.py` to check): in that case use your PC for development and short tests, and Kaggle for long runs.
+
 ## How the environment works
 
 - **What the agent sees:** only the screen, grayscale, downscaled to 80×72, last 3 frames stacked.
@@ -81,6 +93,7 @@ project-MissingNo/
 │   ├── envs/            # the Gymnasium environment (PokemonEnv)
 │   └── agents/          # neural networks
 ├── training/            # training scripts (ppo.py)
+├── notebooks/           # Kaggle notebook
 ├── scripts/             # make_start_state, watch, benchmark_env
 ├── runs/                # training logs and checkpoints (ignored by Git)
 ├── tests/

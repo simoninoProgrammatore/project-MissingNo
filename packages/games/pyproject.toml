@@ -2,7 +2,7 @@
 name = "missingno-games"
 version = "0.1.0"
 description = "Game adapters: read progress signals from each game's memory, used only to compute rewards."
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = ["missingno-core"]
 
 [tool.uv.sources]

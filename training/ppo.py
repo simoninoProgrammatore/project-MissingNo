@@ -67,6 +67,12 @@ class Config:
     # --- logging and saving
     checkpoint_every: int = 50  # in learning updates
     device: str = "auto"  # "auto", "cpu" or "cuda"
+    # --- long runs split across sessions (e.g. Kaggle)
+    resume: str = ""  # path to a checkpoint (.pt) to continue from
+    time_limit_hours: float = 0.0  # stop cleanly and save after this many hours (0 = no limit)
+    # CPU threads for PyTorch. Keep num_envs + torch_threads <= your logical cores,
+    # otherwise the emulators and the network fight for the CPU and everything slows down.
+    torch_threads: int = 2
 
 
 def make_env(cfg: Config, index: int) -> gym.Env:
@@ -81,7 +87,6 @@ def train(cfg: Config) -> None:
     run_dir = Path("runs") / cfg.run_name
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (run_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
-    writer = SummaryWriter(str(run_dir))
 
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -89,6 +94,7 @@ def train(cfg: Config) -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(cfg.device)
+    torch.set_num_threads(cfg.torch_threads)
 
     # N games in parallel. SAME_STEP autoreset: when a game ends, the observation
     # we get back is already the first frame of the next episode, and the final
@@ -125,124 +131,165 @@ def train(cfg: Config) -> None:
     # Rolling statistics over the last finished episodes, for the logs.
     recent_milestones: deque[np.ndarray] = deque(maxlen=50)
     best_reached = 0
+    global_step = 0
+    first_update = 1
+
+    # Resume: restore the network, the optimizer and the counters, so a long run can be
+    # split across several sessions and continue as if it had never stopped.
+    if cfg.resume:
+        saved = torch.load(cfg.resume, map_location=device)
+        agent.load_state_dict(saved["model"])
+        if "optimizer" in saved:
+            optimizer.load_state_dict(saved["optimizer"])
+        global_step = saved.get("global_step", 0)
+        first_update = saved.get("update", 0) + 1
+        best_reached = saved.get("best_reached", 0)
+        print(f"Resumed from {cfg.resume}: step {global_step:,}, update {first_update - 1}")
+    # purge_step drops any log entries written after the checkpoint by an interrupted session.
+    writer = SummaryWriter(str(run_dir), purge_step=global_step if cfg.resume else None)
+
+    def save(path: Path, update: int) -> None:
+        _save(path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update, best_reached)
 
     print(
         f"Run '{cfg.run_name}': {cfg.num_envs} games, {num_updates} updates of {batch_size} steps, "
-        f"device {device}, {sum(p.numel() for p in agent.parameters()):,} parameters"
+        f"device {device}, {cfg.torch_threads} torch threads, "
+        f"{sum(p.numel() for p in agent.parameters()):,} parameters"
     )
 
     next_obs, _ = envs.reset(seed=cfg.seed)
     next_obs = torch.as_tensor(next_obs, device=device)
     next_done = torch.zeros(cfg.num_envs, device=device)
-    global_step = 0
-    start = time.time()
+    start, start_step = time.time(), global_step
+    deadline = start + cfg.time_limit_hours * 3600 if cfg.time_limit_hours > 0 else None
+    completed = first_update - 1  # last fully completed update
 
-    play_time = learn_time = 0.0
-    for update in range(1, num_updates + 1):
-        t_play = time.time()
-        if cfg.anneal_lr:
-            optimizer.param_groups[0]["lr"] = cfg.learning_rate * (1 - (update - 1) / num_updates)
+    try:
+        play_time = learn_time = 0.0
+        for update in range(first_update, num_updates + 1):
+            t_play = time.time()
+            if cfg.anneal_lr:
+                optimizer.param_groups[0]["lr"] = cfg.learning_rate * (
+                    1 - (update - 1) / num_updates
+                )
 
-        # ------------------------------------------------------------- 1. PLAY
-        for t in range(cfg.num_steps):
-            global_step += cfg.num_envs
-            obs_buf[t] = next_obs
-            done_buf[t] = next_done
+            # ------------------------------------------------------------- 1. PLAY
+            for t in range(cfg.num_steps):
+                global_step += cfg.num_envs
+                obs_buf[t] = next_obs
+                done_buf[t] = next_done
+                with torch.inference_mode():
+                    action, logp, _, value = agent.act(next_obs)
+                act_buf[t], logp_buf[t], val_buf[t] = action, logp, value
+
+                obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+                rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
+                # Simplification: a time-limit end is treated like a real end.
+                # Pokémon never "ends", so all our episodes end by time limit.
+                next_done = torch.as_tensor(
+                    np.logical_or(terminated, truncated), device=device, dtype=torch.float32
+                )
+                next_obs = torch.as_tensor(obs, device=device)
+
+                if "final_info" in info:
+                    for i in np.flatnonzero(info["_final_info"]):
+                        best_reached = _log_episode(
+                            writer,
+                            global_step,
+                            info,
+                            i,
+                            milestones,
+                            recent_milestones,
+                            best_reached,
+                        )
+
+            play_time += time.time() - t_play
+            t_learn = time.time()
+
+            # ------------------------------------- 2. ADVANTAGES: how good was each action?
+            # GAE: compare what actually happened (rewards) with what the critic
+            # expected (values). Positive advantage = better than expected.
             with torch.no_grad():
-                action, logp, _, value = agent.act(next_obs)
-            act_buf[t], logp_buf[t], val_buf[t] = action, logp, value
+                next_value = agent.value(next_obs)
+                advantages = torch.zeros_like(rew_buf)
+                last_gae = torch.zeros(cfg.num_envs, device=device)
+                for t in reversed(range(cfg.num_steps)):
+                    if t == cfg.num_steps - 1:
+                        not_done, next_val = 1.0 - next_done, next_value
+                    else:
+                        not_done, next_val = 1.0 - done_buf[t + 1], val_buf[t + 1]
+                    delta = rew_buf[t] + cfg.gamma * next_val * not_done - val_buf[t]
+                    last_gae = delta + cfg.gamma * cfg.gae_lambda * not_done * last_gae
+                    advantages[t] = last_gae
+                returns = advantages + val_buf
 
-            obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
-            rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
-            # Simplification: a time-limit end is treated like a real end.
-            # Pokémon never "ends", so all our episodes end by time limit.
-            next_done = torch.as_tensor(
-                np.logical_or(terminated, truncated), device=device, dtype=torch.float32
-            )
-            next_obs = torch.as_tensor(obs, device=device)
+            # ----------------------------------------------------------- 3. LEARN
+            b_obs = obs_buf.reshape((-1, *obs_shape))
+            b_act, b_logp = act_buf.reshape(-1), logp_buf.reshape(-1)
+            b_adv, b_ret, b_val = advantages.reshape(-1), returns.reshape(-1), val_buf.reshape(-1)
 
-            if "final_info" in info:
-                for i in np.flatnonzero(info["_final_info"]):
-                    best_reached = _log_episode(
-                        writer, global_step, info, i, milestones, recent_milestones, best_reached
-                    )
+            clipfracs = []
+            for _ in range(cfg.update_epochs):
+                for idx in torch.randperm(batch_size, device=device).split(minibatch_size):
+                    _, new_logp, entropy, new_value = agent.act(b_obs[idx], b_act[idx])
+                    ratio = (new_logp - b_logp[idx]).exp()  # new policy / old policy
+                    with torch.no_grad():
+                        clipfracs.append(((ratio - 1).abs() > cfg.clip_coef).float().mean().item())
 
-        play_time += time.time() - t_play
-        t_learn = time.time()
+                    adv = b_adv[idx]
+                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        # ------------------------------------- 2. ADVANTAGES: how good was each action?
-        # GAE: compare what actually happened (rewards) with what the critic
-        # expected (values). Positive advantage = better than expected.
-        with torch.no_grad():
-            next_value = agent.value(next_obs)
-            advantages = torch.zeros_like(rew_buf)
-            last_gae = torch.zeros(cfg.num_envs, device=device)
-            for t in reversed(range(cfg.num_steps)):
-                if t == cfg.num_steps - 1:
-                    not_done, next_val = 1.0 - next_done, next_value
-                else:
-                    not_done, next_val = 1.0 - done_buf[t + 1], val_buf[t + 1]
-                delta = rew_buf[t] + cfg.gamma * next_val * not_done - val_buf[t]
-                last_gae = delta + cfg.gamma * cfg.gae_lambda * not_done * last_gae
-                advantages[t] = last_gae
-            returns = advantages + val_buf
+                    # Policy loss: push up actions with positive advantage, but clip the
+                    # ratio so one update cannot change the policy too much.
+                    pg_loss = torch.max(
+                        -adv * ratio, -adv * ratio.clamp(1 - cfg.clip_coef, 1 + cfg.clip_coef)
+                    ).mean()
+                    # Value loss: teach the critic to predict the actual returns.
+                    v_loss = 0.5 * ((new_value - b_ret[idx]) ** 2).mean()
+                    # Entropy bonus: keep some randomness, so the agent keeps exploring.
+                    ent_loss = entropy.mean()
 
-        # ----------------------------------------------------------- 3. LEARN
-        b_obs = obs_buf.reshape((-1, *obs_shape))
-        b_act, b_logp = act_buf.reshape(-1), logp_buf.reshape(-1)
-        b_adv, b_ret, b_val = advantages.reshape(-1), returns.reshape(-1), val_buf.reshape(-1)
+                    loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent_loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
 
-        clipfracs = []
-        for _ in range(cfg.update_epochs):
-            for idx in torch.randperm(batch_size, device=device).split(minibatch_size):
-                _, new_logp, entropy, new_value = agent.act(b_obs[idx], b_act[idx])
-                ratio = (new_logp - b_logp[idx]).exp()  # new policy / old policy
-                with torch.no_grad():
-                    clipfracs.append(((ratio - 1).abs() > cfg.clip_coef).float().mean().item())
+            learn_time += time.time() - t_learn
 
-                adv = b_adv[idx]
-                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            # ------------------------------------------------------------- logging
+            sps = int((global_step - start_step) / (time.time() - start))
+            explained_var = 1 - torch.var(b_ret - b_val) / (torch.var(b_ret) + 1e-8)
+            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+            writer.add_scalar("charts/SPS", sps, global_step)
+            writer.add_scalar("losses/policy", pg_loss.item(), global_step)
+            writer.add_scalar("losses/value", v_loss.item(), global_step)
+            writer.add_scalar("losses/entropy", ent_loss.item(), global_step)
+            writer.add_scalar("losses/clipfrac", float(np.mean(clipfracs)), global_step)
+            writer.add_scalar("losses/explained_variance", explained_var.item(), global_step)
 
-                # Policy loss: push up actions with positive advantage, but clip the
-                # ratio so one update cannot change the policy too much.
-                pg_loss = torch.max(
-                    -adv * ratio, -adv * ratio.clamp(1 - cfg.clip_coef, 1 + cfg.clip_coef)
-                ).mean()
-                # Value loss: teach the critic to predict the actual returns.
-                v_loss = 0.5 * ((new_value - b_ret[idx]) ** 2).mean()
-                # Entropy bonus: keep some randomness, so the agent keeps exploring.
-                ent_loss = entropy.mean()
+            if update % 10 == 0 or update == num_updates:
+                share = play_time / (play_time + learn_time)
+                print(
+                    f"update {update}/{num_updates}  steps {global_step:,}  SPS {sps}  "
+                    f"(playing {share:.0%} of the time)  best milestones {best_reached}/{len(milestones)}"
+                )
+            completed = update
+            if update % cfg.checkpoint_every == 0 or update == num_updates:
+                save(run_dir / "checkpoints" / f"step_{global_step}.pt", update)
+                save(run_dir / "checkpoints" / "latest.pt", update)
+            if deadline and time.time() > deadline:
+                print(f"Time limit of {cfg.time_limit_hours} h reached: saving and stopping.")
+                save(run_dir / "checkpoints" / "latest.pt", update)
+                print(f"Resume with: --resume {run_dir / 'checkpoints' / 'latest.pt'}")
+                break
 
-                loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent_loss
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-
-        learn_time += time.time() - t_learn
-
-        # ------------------------------------------------------------- logging
-        sps = int(global_step / (time.time() - start))
-        explained_var = 1 - torch.var(b_ret - b_val) / (torch.var(b_ret) + 1e-8)
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("charts/SPS", sps, global_step)
-        writer.add_scalar("losses/policy", pg_loss.item(), global_step)
-        writer.add_scalar("losses/value", v_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", ent_loss.item(), global_step)
-        writer.add_scalar("losses/clipfrac", float(np.mean(clipfracs)), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var.item(), global_step)
-
-        if update % 10 == 0 or update == num_updates:
-            share = play_time / (play_time + learn_time)
-            print(
-                f"update {update}/{num_updates}  steps {global_step:,}  SPS {sps}  "
-                f"(playing {share:.0%} of the time)  best milestones {best_reached}/{len(milestones)}"
-            )
-        if update % cfg.checkpoint_every == 0 or update == num_updates:
-            _save(
-                agent, cfg, run_dir / "checkpoints" / f"step_{global_step}.pt", obs_shape, n_actions
-            )
-            _save(agent, cfg, run_dir / "checkpoints" / "latest.pt", obs_shape, n_actions)
+    except KeyboardInterrupt:
+        # Ctrl+C: save what we have, so the run can still be watched or resumed.
+        # The experience of the interrupted update is discarded: we save the last complete one.
+        global_step = completed * batch_size
+        print(f"\nInterrupted: saving the model at step {global_step:,} (last complete update)...")
+        save(run_dir / "checkpoints" / "latest.pt", completed)
 
     envs.close()
     writer.close()
@@ -272,13 +319,18 @@ def _log_episode(writer, step, info, i, milestones, recent, best_reached) -> int
     return max(best_reached, n_reached)
 
 
-def _save(agent, cfg, path, obs_shape, n_actions) -> None:
+def _save(path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update, best_reached):
+    """Everything needed both to watch the agent and to resume training."""
     torch.save(
         {
             "model": agent.state_dict(),
+            "optimizer": optimizer.state_dict(),
             "obs_shape": tuple(obs_shape),
             "n_actions": int(n_actions),
             "config": dataclasses.asdict(cfg),
+            "global_step": global_step,
+            "update": update,
+            "best_reached": best_reached,
         },
         path,
     )

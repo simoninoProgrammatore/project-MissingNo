@@ -2,7 +2,7 @@
 name = "missingno-core"
 version = "0.1.0"
 description = "Contratti condivisi: stato di gioco, obiettivi, azioni, abilità."
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = ["pydantic>=2.7"]
 
 [build-system]

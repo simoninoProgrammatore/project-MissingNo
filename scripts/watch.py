@@ -85,6 +85,13 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="print every reward")
     parser.add_argument("--no-window", action="store_true", help="run without a window")
     args = parser.parse_args()
+    if args.checkpoint and not Path(args.checkpoint).exists():
+        available = sorted(str(p) for p in Path("runs").glob("*/checkpoints/*.pt"))
+        print(f"Checkpoint not found: {args.checkpoint}")
+        print("Available checkpoints:" if available else "No checkpoints in runs/ yet.")
+        for path in available:
+            print(f"  {path}")
+        raise SystemExit(1)
     if not Path(args.state).exists():
         print(f"No start state at {args.state}: booting from power-on.")
         args.state = None

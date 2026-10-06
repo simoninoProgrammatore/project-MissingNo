@@ -2,7 +2,7 @@
 name = "missingno-agents"
 version = "0.1.0"
 description = "Neural networks and learning code for the agents."
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.0",
     "torch>=2.5",
