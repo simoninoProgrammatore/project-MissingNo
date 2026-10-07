@@ -188,3 +188,10 @@ def test_recording_is_saved_when_an_episode_from_the_start_ends(tmp_path):
     frames = np.load(info["recording"])["frames"]
     assert frames.shape == (3, 144, 160)  # full resolution, one frame every 2 steps
     env.close()
+
+
+def test_unreadable_start_state_has_a_clear_error(tmp_path):
+    bad = tmp_path / "bad.state"
+    bad.write_bytes(b"not a save state")
+    with pytest.raises(RuntimeError, match="NOT compatible across PyBoy versions"):
+        make_env(start_state_path=str(bad))

@@ -113,6 +113,18 @@ class PokemonEnv(gym.Env):
 
         if config.start_state_path:
             self._start_state = Path(config.start_state_path).read_bytes()
+            try:
+                self.pyboy.load_state(io.BytesIO(self._start_state))
+            except Exception as error:
+                import pyboy as _pyboy
+
+                raise RuntimeError(
+                    f"Cannot load the start state {config.start_state_path} with PyBoy "
+                    f"{getattr(_pyboy, '__version__', '?')}: {error}\n"
+                    "Save states are NOT compatible across PyBoy versions. Use the PyBoy "
+                    "version that created it (see uv.lock), or recreate it with "
+                    "scripts/make_start_state.py."
+                ) from error
         else:
             # No start state: snapshot the power-on state, so every reset is identical.
             buffer = io.BytesIO()

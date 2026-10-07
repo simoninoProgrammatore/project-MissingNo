@@ -142,6 +142,11 @@ def make_env(cfg: Config, index: int) -> gym.Env:
 
 def train(cfg: Config) -> None:
     # ------------------------------------------------------------------ setup
+    if not Path(cfg.state).exists():
+        print(
+            f"\n!!! WARNING: start state {cfg.state} not found: every episode starts from "
+            "the power-on screen (title screen, new game, names), not from the bedroom.\n"
+        )
     if cfg.reward_version not in COMPONENTS:
         raise SystemExit(
             f"Unknown --reward-version {cfg.reward_version!r}: choose from {sorted(COMPONENTS)}"
