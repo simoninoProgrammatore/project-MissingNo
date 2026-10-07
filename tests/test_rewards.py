@@ -148,3 +148,65 @@ def test_badge_is_the_biggest_single_reward():
 def test_unknown_version_fails_clearly():
     with pytest.raises(ValueError, match="Unknown reward version"):
         RewardConfig.preset("v9")
+
+
+# --- v2.1: exploration that wears out with use -----------------------------------
+
+C21 = RewardConfig.preset("v2.1")
+
+
+def episodes(tracker, n, states):
+    """Play the same short episode n times; return the parts of the last one."""
+    for _ in range(n):
+        tracker.reset(states[0])
+        parts = [tracker.step(s, i)[1] for i, s in enumerate(states[1:], start=1)]
+    return parts
+
+
+def test_tile_reward_decays_across_episodes():
+    tracker = RewardTracker(C21)
+    walk = [S(), S(x=1)]
+    first = episodes(tracker, 1, walk)[0]["new_tile"]
+    hundredth = episodes(tracker, 99, walk)[0]["new_tile"]
+    assert first == pytest.approx(C21.rare_tile)
+    assert hundredth == pytest.approx(C21.rare_tile / 10)
+
+
+def test_rare_tiles_are_worth_more_than_common_ones():
+    tracker = RewardTracker(C21)
+    episodes(tracker, 50, [S(), S(x=1)])  # x=1 is visited in every episode
+    parts = episodes(tracker, 1, [S(), S(x=1), S(x=2)])  # x=2 is brand new
+    assert parts[1]["new_tile"] > 5 * parts[0]["new_tile"]
+
+
+def test_tile_still_pays_once_per_episode():
+    tracker = RewardTracker(C21)
+    tracker.reset(S())
+    tracker.step(S(x=1), 1)
+    _, parts = tracker.step(S(x=1), 2)
+    assert "new_tile" not in parts
+
+
+def test_passages_are_directed_and_pay_once_per_episode():
+    tracker = RewardTracker(C21)
+    lab, town = 40, 0
+    states = [S(map_id=town), S(map_id=lab), S(map_id=town), S(map_id=lab), S(map_id=town)]
+    tracker.reset(states[0])
+    for i, s in enumerate(states[1:], start=1):
+        tracker.step(s, i)
+    # In and out: two passages, each paid once, however many times the door is used.
+    assert tracker.totals["passage"] == pytest.approx(2 * C21.passage)
+
+
+def test_passage_reward_decays_across_episodes():
+    tracker = RewardTracker(C21)
+    door = [S(map_id=0), S(map_id=40)]
+    assert episodes(tracker, 1, door)[0]["passage"] == pytest.approx(C21.passage)
+    assert episodes(tracker, 3, door)[0]["passage"] == pytest.approx(C21.passage / 2)
+
+
+def test_v2_is_unchanged_by_v21():
+    tracker = RewardTracker(C)
+    parts = episodes(tracker, 10, [S(map_id=0), S(map_id=1, map_area=400, x=1)])[0]
+    assert parts["new_tile"] == pytest.approx(C.new_tile)
+    assert "passage" not in parts

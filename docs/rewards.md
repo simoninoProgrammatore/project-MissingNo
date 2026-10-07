@@ -1,6 +1,6 @@
 # Project MissingNo — Reward design (RL only)
 
-> **Status:** v1 and v2 are implemented (`packages/envs/src/missingno_envs/rewards.py`, selected with `--reward-version`; v2 is the default). v3 and v4 are design proposals. Components are added one at a time and ablated (Section 9). Weights are tuned **only on training games** and frozen before any held-out evaluation.
+> **Status:** v1, v2 and v2.1 are implemented (`packages/envs/src/missingno_envs/rewards.py`, selected with `--reward-version`; v2 is the default). v3 and v4 are design proposals. Components are added one at a time and ablated (Section 9). Weights are tuned **only on training games** and frozen before any held-out evaluation.
 
 The reward is the only thing that tells a tabula rasa agent what "playing well" means. It must push toward progress in *every* Generation 1–3 game without ever saying *what* to do or *where* to go.
 
@@ -168,6 +168,14 @@ Episodic alone makes the agent re-explore the same early towns every episode; li
 
 ---
 
+### 5.1 v2.1: a cheap step toward lifelong novelty
+
+Observed in the first v2 run: the agent learned to obtain the starter within ~120k steps, then got stuck in Oak's lab. The lab is fully explored in every episode, so after the battle nothing pays, the stagnation rule ends the episode, and the agent practices again and again the part it already masters.
+
+v2.1 keeps the episodic rule (a tile pays at most once per episode, so nothing can be farmed) but scales it by **how many past episodes have already visited that tile**: `rare_tile / √n`. Tiles reached in every episode (bedroom, lab) fade toward zero; rarely reached ones (the north of Pallet Town, Route 1) stay valuable. The same applies to **passages** between maps, counted per direction, so leaving the lab through its door is a new passage even if the town is already known.
+
+Counts are built only from the agent's own experience and never reset during training. With parallel games, each game keeps its own counts (an approximation; they can be shared later). This is count-based exploration, a general principle, not knowledge of the game.
+
 ## 6. Stagnation: truncation, not penalty
 
 If an episode produces **no extrinsic progress and no new tile for K steps** (start: K = 2,000), it is truncated. Effects:
@@ -208,6 +216,7 @@ If an invariant breaks, the episode ends **with no reward for that step**, and t
 |---|---|---|
 | v1 ✅ | tiles, maps, badges, levels (linear, max-so-far) | Phase 1 baseline |
 | v2 ✅ (default) | area-scaled maps, concave top-4 levels, new items (key items worth more), Pokédex, stagnation truncation | Phase 1 |
+| v2.1 ✅ | v2 + lifelong rarity of tiles (episodic first visit × 1/√(episodes that visited it)) + directed passages between maps, same decay | Phase 1 (after the lab bottleneck) |
 | v3 | dialogue novelty, HP/PP potentials, blackout, first trainer wins, corruption guard | Phase 1–2 |
 | v4 | two value heads, episodic + lifelong (RND) novelty | Phase 2 |
 | Declared extras | event-flag count; HM-specific reward | separate experiments, reported apart |

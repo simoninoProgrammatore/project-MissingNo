@@ -44,6 +44,9 @@ uv run python training/ppo.py --total-steps 1_000_000 --run-name smoke
 # 2. Watch the curves (open the link it prints, usually http://localhost:6006)
 uv run tensorboard --logdir runs
 
+# 2b. Or watch one of the games live while the agent learns (stop with Ctrl+C, not by closing the window)
+uv run python training/ppo.py --total-steps 1_000_000 --run-name smoke --show
+
 # 3. Watch the trained agent play
 uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt
 
@@ -54,7 +57,31 @@ uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt --n
 uv run python training/ppo.py --total-steps 100_000_000 --seed 1 --run-name ppo_s1
 ```
 
-**Reward versions** (design in `docs/rewards.md`): `--reward-version v2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline. When resuming a run, use the same version it was trained with (the script warns you if not).
+**Reward versions** (design in `docs/rewards.md`): `--reward-version v2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline; `--reward-version v2.1` adds exploration that wears out with use.
+
+To try a new reward **starting from an already trained model**, resume it into a new run, so the original stays untouched:
+
+```bash
+uv run python training/ppo.py ... --reward-version v2.1 --run-name v21_from_v2 --resume runs/v2_s1/checkpoints/latest.pt
+``` When resuming a run, use the same version it was trained with (the script warns you if not).
+
+**State archive** (`--archive-prob 0.5`): a simple form of Go-Explore. Whenever the agent reaches a new region of a map, or makes progress, the emulator state is saved; then half of the episodes start from one of those states instead of the bedroom, favouring the less explored ones. The agent practices where it gets stuck instead of replaying the beginning. All states come from the agent's own play. Episodes started from the archive are logged under `archive/*` and excluded from the milestone curves, which always measure progress from the bedroom. The archive lives in memory and is rebuilt after a resume.
+
+**Archive by learning progress** (`--archive-progress-weight`, default 1): archived states also remember how the episodes started from them went. States where results are changing, i.e. where the agent is currently learning, are chosen more often; too easy or too hard ones less (inspired by Prioritized Level Replay).
+
+**Backward curriculum** (`--curriculum-prob 0.3`): when an episode reaches a map that no episode ever reached before, its path (one saved state every 64 steps) becomes a *demo*. Some episodes then start just before that success; when the agent reaches the goal in at least 4 of the last 8 tries, the start moves one step back, until the whole path is learned. The demos are the agent's own successes: no human data. Logged under `curriculum/*`, excluded from the milestone curves.
+
+**Self-imitation learning** (`--sil-coef 1.0`): the 5% of actions of each batch that turned out much better than expected are kept in a buffer (~170 MB of RAM for 10,000), and replayed at every learning phase, but only while they are still better than what the agent now expects. A rare success is practiced instead of forgotten. Logged under `sil/*`.
+
+**Stagnation** (`--stagnation-steps`): end an episode after this many steps without progress; `0` = never, `-1` = the reward version's default.
+
+**Highlights** (`--record-every 8`): GIFs of the episodes that went furthest, saved while training runs in `runs/<run-name>/gifs/` (open them with a browser). Every record-breaking episode (more milestones, then more maps, then more tiles) is saved immediately as `record_*.gif` and kept; every `--gif-every-steps` (default 10,000) the best episode of that window is saved as `best_*.gif`, keeping the last `--gif-keep` (default 20). Only episodes from the start state are recorded. Memory: about 60 MB per game with `--record-every 8` and 20,000-step episodes; GIFs are encoded in a separate process.
+
+All of them together, starting from an already trained model:
+
+```bash
+uv run python training/ppo.py --total-steps 20_000_000 --seed 1 --num-envs 4 --reward-version v2.1 --episode-steps 20000 --stagnation-steps 0 --archive-prob 0.3 --curriculum-prob 0.3 --sil-coef 1.0 --record-every 8 --run-name explore_all --resume runs/<run>/checkpoints/latest.pt
+```
 
 Every hyperparameter is a command-line option (`--num-envs`, `--learning-rate`, `--ent-coef`, ...): see `training/ppo.py` or run it with `--help`. Each run saves its configuration, TensorBoard logs and checkpoints in `runs/<run-name>/` (ignored by Git).
 

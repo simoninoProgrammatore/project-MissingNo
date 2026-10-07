@@ -134,3 +134,57 @@ def test_info_reports_reward_totals():
     assert info["reward_totals"]["new_tile"] == pytest.approx(env.rewards.new_tile)
     assert set(info["reward_totals"]) == set(env._tracker.components)
     env.close()
+
+
+def test_archive_restarts_episodes_from_reached_states():
+    seq = [ProgressSignals(map_id=0, x=0, y=0)] + [ProgressSignals(map_id=1, x=9, y=9)] * 50
+    env = make_env(seq, archive_prob=1.0)
+    _, info = env.reset(seed=0)
+    assert not info["from_archive"]  # empty archive: normal start
+    *_, info = env.step(0)
+    assert info["archive_cells"] >= 1
+    _, info = env.reset(seed=0)
+    assert info["from_archive"]
+    env.close()
+
+
+def test_archive_is_off_by_default():
+    env = make_env()
+    _, info = env.reset(seed=0)
+    env.step(0)
+    _, info = env.reset(seed=0)
+    assert env.archive is None and not info["from_archive"]
+    env.close()
+
+
+def test_first_ever_new_map_becomes_a_demo_and_demo_episodes_end_on_success():
+    town = ProgressSignals(map_id=0, x=0, y=0)
+    route = ProgressSignals(map_id=12, x=0, y=0)
+    seq = [town] * 5 + [route] * 3 + [town] * 2 + [route] * 50
+    env = make_env(seq, curriculum_prob=1.0, curriculum_interval=2)
+    env.reset(seed=0)
+    for _ in range(5):
+        *_, info = env.step(0)
+    assert info["demos_active"] == 1  # route reached for the first time ever
+    _, info = env.reset(seed=0)
+    assert info["from_demo"]
+    outcomes = []
+    for _ in range(5):
+        *_, truncated, info = env.step(0)
+        outcomes.append((info["demo_success"], truncated))
+        if truncated:
+            break
+    # The scripted adapter reaches the route again: success ends the episode.
+    assert outcomes[-1] == (True, True)
+    env.close()
+
+
+def test_recording_is_saved_when_an_episode_from_the_start_ends(tmp_path):
+    env = make_env(max_steps=6, record_every=2, record_dir=str(tmp_path), record_tag="t")
+    env.reset(seed=0)
+    for _ in range(6):
+        *_, truncated, info = env.step(0)
+    assert truncated and info["recording"].endswith(".npz")
+    frames = np.load(info["recording"])["frames"]
+    assert frames.shape == (3, 144, 160)  # full resolution, one frame every 2 steps
+    env.close()

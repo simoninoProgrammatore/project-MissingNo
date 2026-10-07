@@ -11,6 +11,14 @@ Versions:
 - v2: maps weighted by size, a concave "team strength" instead of linear levels,
        new items (key items worth more), Pokédex owned/seen, and stagnation
        truncation (episodes with no progress for too long end early).
+- v2.1: v2 plus exploration that wears out with use. A new tile is still paid
+       once per episode, but its value decays with how many past episodes have
+       already visited it (1/sqrt(n)), so places seen in every episode become
+       nearly worthless and rarely visited places become attractive. Passages
+       between maps (doors, stairs, exits) are rewarded the first time they are
+       crossed in each direction, with the same decay.
+       The counts are kept for the whole training and built only from the
+       agent's own experience: no map, no knowledge of the game.
 """
 
 from __future__ import annotations
@@ -23,6 +31,16 @@ from missingno_core import ProgressSignals
 COMPONENTS: dict[str, tuple[str, ...]] = {
     "v1": ("new_tile", "new_map", "badge", "level"),
     "v2": ("new_tile", "new_map", "badge", "team", "new_item", "dex_owned", "dex_seen"),
+    "v2.1": (
+        "new_tile",
+        "new_map",
+        "passage",
+        "badge",
+        "team",
+        "new_item",
+        "dex_owned",
+        "dex_seen",
+    ),
 }
 
 
@@ -47,14 +65,17 @@ class RewardConfig:
     dex_owned_scale: float = 20.0  # owned species reward decays as 1/sqrt(1 + owned/scale)
     dex_seen: float = 0.05
     stagnation_steps: int = 2000  # 0 = never truncate for lack of progress
+    # v2.1 only: rewards that decay with how many past episodes already had them
+    rare_tile: float = 0.1  # a never-visited tile; after n episodes it is worth rare_tile/sqrt(n)
+    passage: float = 0.2  # a never-crossed passage between maps, in one direction
 
     @classmethod
     def preset(cls, version: str) -> RewardConfig:
         if version == "v1":
             # Exactly the Phase 1 baseline.
             return cls(version="v1", badge=5.0, stagnation_steps=0)
-        if version == "v2":
-            return cls(version="v2")
+        if version in ("v2", "v2.1"):
+            return cls(version=version)
         raise ValueError(f"Unknown reward version {version!r}: choose from {sorted(COMPONENTS)}")
 
     def with_weights(self, **weights: float) -> RewardConfig:
@@ -80,11 +101,18 @@ class RewardTracker:
         self.config = config
         self.components = COMPONENTS[config.version]
         self.totals: dict[str, float] = {}
+        # v2.1, lifelong: in how many episodes each tile / passage has been reached.
+        # Never reset: this is what makes exploration "wear out" with use.
+        self.tile_episodes: dict[tuple[int, int, int], int] = {}
+        self.passage_episodes: dict[tuple[int, int], int] = {}
 
     def reset(self, s: ProgressSignals) -> None:
         c = self.config
         self.visited_tiles = {s.cell}
         self.visited_maps = {s.map_id}
+        self.crossed_passages: set[tuple[int, int]] = set()
+        self.previous_map = s.map_id
+        self._count(self.tile_episodes, s.cell)
         self.best_badges = s.badges
         self.best_total_level = s.total_level
         self.best_team = team_strength(s.party_levels, c.team_size)
@@ -100,7 +128,19 @@ class RewardTracker:
 
         if s.cell not in self.visited_tiles:
             self.visited_tiles.add(s.cell)
-            parts["new_tile"] = c.new_tile
+            if c.version == "v2.1":
+                n = self._count(self.tile_episodes, s.cell)
+                parts["new_tile"] = c.rare_tile / math.sqrt(n)
+            else:
+                parts["new_tile"] = c.new_tile
+
+        if c.version == "v2.1" and s.map_id != self.previous_map:
+            passage = (self.previous_map, s.map_id)  # directed: in and out are different
+            if passage not in self.crossed_passages:
+                self.crossed_passages.add(passage)
+                n = self._count(self.passage_episodes, passage)
+                parts["passage"] = c.passage / math.sqrt(n)
+        self.previous_map = s.map_id
 
         if s.map_id not in self.visited_maps:
             self.visited_maps.add(s.map_id)
@@ -147,6 +187,12 @@ class RewardTracker:
             for name, value in parts.items():
                 self.totals[name] += value
         return sum(parts.values()), parts
+
+    @staticmethod
+    def _count(counts: dict, key) -> int:
+        """Record one more episode reaching `key`; return the updated count."""
+        counts[key] = counts.get(key, 0) + 1
+        return counts[key]
 
     def stagnant(self, step: int) -> bool:
         """True if nothing new has happened for too long: the episode should end.
