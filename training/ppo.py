@@ -12,6 +12,7 @@ The whole algorithm is a loop of two halves:
 Usage (from the repository root):
     uv run python training/ppo.py --total-steps 1_000_000 --run-name smoke
     uv run python training/ppo.py --total-steps 100_000_000 --seed 1 --run-name ppo_s1
+    uv run python training/ppo.py --games red,blue,yellow --num-envs 6 --run-name gen1_s1
 
 Watch the curves:
     uv run tensorboard --logdir runs
@@ -36,9 +37,9 @@ import numpy as np
 import torch
 from gymnasium.vector import AutoresetMode
 from highlights import Highlights
-from missingno_agents import CnnActorCritic
+from missingno_agents import build_network
 from missingno_envs import COMPONENTS, EnvConfig, PokemonEnv, RewardConfig
-from missingno_games import ADAPTERS
+from missingno_games import ADAPTERS, default_rom, default_state
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
@@ -49,16 +50,27 @@ class Config:
     run_name: str = "ppo"
     seed: int = 1
     game: str = "red"
-    rom: str = "roms/pokemon_red.gb"
-    state: str = "states/red_start.state"
+    rom: str = ""  # default: roms/pokemon_<game>.gb (or .gbc)
+    state: str = ""  # default: states/<game>_start.state
+    # Several games in the same run, one model: e.g. "red,blue,yellow". The parallel
+    # games are shared out in turn (6 games and 3 titles = 2 each), so num_envs should
+    # be a multiple of the number of titles. ROMs and start states are taken from the
+    # default paths. Overrides --game, --rom and --state.
+    games: str = ""
+    # Crystal is the held-out test game (docs/research.md): training on it is refused
+    # unless this is set, so the test cannot be contaminated by mistake.
+    allow_held_out: bool = False
     total_steps: int = 100_000_000  # agent steps, summed over all parallel games
     # Length of one episode. One step = 24 frames = 0.4 s of game time, so 8192 steps
     # are ~55 minutes of play. Longer episodes give the agent time to go further.
     episode_steps: int = 8192
-    reward_version: str = "v2"  # see docs/rewards.md; "v1" = the original Phase 1 baseline
+    reward_version: str = "v2.2"  # see docs/rewards.md; "v1" = the original Phase 1 baseline
     # End an episode after this many steps without progress. -1 = the reward version's
-    # default (v2: 2000), 0 = never.
+    # default (v2, v2.1: 2000; v2.2: 5000), 0 = never.
     stagnation_steps: int = -1
+    # End an episode after this many steps of one battle without progress (catches the
+    # "flee loop" in trainer battles). -1 = the reward version's default (v2.2: 1000), 0 = never.
+    battle_stagnation_steps: int = -1
     # --- exploration (docs/rewards.md, docs/SETUP.md). All off by default.
     # Go-Explore style archive: probability that an episode starts from a state the
     # agent itself reached earlier, instead of the start state. Try 0.3-0.5.
@@ -78,10 +90,19 @@ class Config:
     record_every: int = 0  # keep one frame every N steps of each episode; 0 = off. Try 4
     gif_every_steps: int = 10_000  # save the best episode of each window of this many steps
     gif_keep: int = 20  # periodic GIFs kept; record-breaking GIFs are always kept
+    # --- memory
+    # "none": the agent decides from the last 3 frames (about one second of game).
+    # "gru": a short-term memory carried from step to step and wiped at every new
+    # episode, so the agent can remember what is not on the screen (e.g. that it
+    # is carrying Oak's Parcel). It learns what to remember over num_steps steps.
+    memory: str = "none"
+    memory_size: int = 256
     # --- final goal
     # Stop training as soon as an episode from the start state reaches the last
     # milestone (for Red: the Boulder Badge). Its replay is saved in
-    # runs/<name>/replays, the model in checkpoints/winner.pt.
+    # runs/<name>/replays, the model in checkpoints/winner.pt. With several games,
+    # training stops when every game has been won at least once; the model at the
+    # first win of each game is saved as checkpoints/winner_<game>.pt.
     stop_at_goal: bool = False
     # --- parallelism
     num_envs: int = 6  # parallel games: leave a core or two free for the OS
@@ -113,14 +134,40 @@ class Config:
     torch_threads: int = 2
 
 
+def game_list(cfg: Config) -> list[str]:
+    """The titles played in this run: --games if given, otherwise --game."""
+    games = [g.strip() for g in cfg.games.split(",") if g.strip()] if cfg.games else [cfg.game]
+    unknown = [g for g in games if g not in ADAPTERS]
+    if unknown:
+        raise SystemExit(f"Unknown game(s) {unknown}: choose from {sorted(ADAPTERS)}")
+    return games
+
+
+def game_of(cfg: Config, index: int) -> str:
+    """Which title the parallel game number `index` plays (shared out in turn)."""
+    games = game_list(cfg)
+    return games[index % len(games)]
+
+
+def game_files(cfg: Config, game: str) -> tuple[str, str]:
+    """ROM and start state of a title: --rom/--state for a single game, else the defaults."""
+    if cfg.games:
+        return default_rom(game), default_state(game)
+    return cfg.rom or default_rom(game), cfg.state or default_state(game)
+
+
 def make_env(cfg: Config, index: int) -> gym.Env:
     """Build one game. Defined at top level so subprocesses can create it."""
-    state = cfg.state if Path(cfg.state).exists() else None
+    game = game_of(cfg, index)
+    rom, state = game_files(cfg, game)
+    state = state if Path(state).exists() else None
     rewards = RewardConfig.preset(cfg.reward_version)
     if cfg.stagnation_steps >= 0:
         rewards = rewards.with_weights(stagnation_steps=cfg.stagnation_steps)
+    if cfg.battle_stagnation_steps >= 0:
+        rewards = rewards.with_weights(battle_stagnation_steps=cfg.battle_stagnation_steps)
     env_cfg = EnvConfig(
-        rom_path=cfg.rom,
+        rom_path=rom,
         start_state_path=state,
         max_steps=cfg.episode_steps,
         rewards=rewards,
@@ -129,24 +176,44 @@ def make_env(cfg: Config, index: int) -> gym.Env:
         curriculum_prob=cfg.curriculum_prob,
         record_every=cfg.record_every,
         record_dir=str(Path("runs") / cfg.run_name / "recordings"),
-        record_tag=f"env{index}",
+        record_tag=f"{game}_env{index}",
         stop_at_goal=cfg.stop_at_goal,
         replay_dir=str(Path("runs") / cfg.run_name / "replays"),
     )
     if cfg.show and index == 0:
         # emulation_speed=0: the watched game must not slow down the other games,
         # which would all wait for it at every step.
-        return PokemonEnv(env_cfg, ADAPTERS[cfg.game](), render_mode="human", emulation_speed=0)
-    return PokemonEnv(env_cfg, ADAPTERS[cfg.game]())
+        return PokemonEnv(env_cfg, ADAPTERS[game](), render_mode="human", emulation_speed=0)
+    return PokemonEnv(env_cfg, ADAPTERS[game]())
 
 
 def train(cfg: Config) -> None:
     # ------------------------------------------------------------------ setup
-    if not Path(cfg.state).exists():
-        print(
-            f"\n!!! WARNING: start state {cfg.state} not found: every episode starts from "
-            "the power-on screen (title screen, new game, names), not from the bedroom.\n"
+    games = game_list(cfg)
+    multi = len(games) > 1
+    held_out = [g for g in games if getattr(ADAPTERS[g], "held_out", False)]
+    if held_out and not cfg.allow_held_out:
+        raise SystemExit(
+            f"{', '.join(held_out)} is held out: it is only used to test generalization, "
+            "never for training (docs/research.md). Evaluate on it with scripts/evaluate.py. "
+            "To train on it anyway, as a declared separate experiment, add --allow-held-out."
         )
+    for game in games:
+        rom, state = game_files(cfg, game)
+        if not Path(rom).exists():
+            raise SystemExit(f"ROM for {game} not found at {rom} (see roms/README.md).")
+        if not Path(state).exists():
+            print(
+                f"\n!!! WARNING: start state {state} not found: every {game} episode starts "
+                "from the power-on screen (title screen, new game, names), not from the "
+                f"bedroom. Create it with: scripts/make_start_state.py --game {game}\n"
+            )
+    if cfg.num_envs % len(games):
+        print(
+            f"NOTE: {cfg.num_envs} parallel games for {len(games)} titles: some titles get "
+            "more games than others. Use a multiple of the number of titles."
+        )
+    env_games = [game_of(cfg, i) for i in range(cfg.num_envs)]
     if cfg.reward_version not in COMPONENTS:
         raise SystemExit(
             f"Unknown --reward-version {cfg.reward_version!r}: choose from {sorted(COMPONENTS)}"
@@ -174,17 +241,30 @@ def train(cfg: Config) -> None:
             factories, autoreset_mode=AutoresetMode.SAME_STEP, context="spawn"
         )
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
-    milestones = ADAPTERS[cfg.game].milestones
+    milestones = {g: ADAPTERS[g].milestones for g in games}
 
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n
-    agent = CnnActorCritic(obs_shape, n_actions).to(device)
+    agent = build_network(obs_shape, n_actions, cfg.memory, cfg.memory_size).to(device)
+    recurrent = agent.recurrent
+    if recurrent and cfg.num_envs % min(cfg.num_minibatches, cfg.num_envs):
+        raise SystemExit("With --memory gru, --num-envs must be a multiple of --num-minibatches.")
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
 
     batch_size = cfg.num_envs * cfg.num_steps
-    sil = SelfImitationBuffer(cfg.sil_capacity, tuple(obs_shape)) if cfg.sil_coef > 0 else None
+    sil = (
+        SelfImitationBuffer(cfg.sil_capacity, tuple(obs_shape), cfg.memory_size if recurrent else 0)
+        if cfg.sil_coef > 0
+        else None
+    )
+    # One set of highlights per title: their milestones are not comparable.
     highlights = (
-        Highlights(run_dir / "gifs", cfg.gif_every_steps, cfg.gif_keep)
+        {
+            g: Highlights(
+                run_dir / "gifs" / (g if multi else ""), cfg.gif_every_steps, cfg.gif_keep
+            )
+            for g in games
+        }
         if cfg.record_every > 0
         else None
     )
@@ -200,10 +280,18 @@ def train(cfg: Config) -> None:
     rew_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
     done_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
     val_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
+    # With memory: the memory state before each step (after the reset of a new episode).
+    mem_buf = (
+        torch.zeros((cfg.num_steps, cfg.num_envs, cfg.memory_size), device=device)
+        if recurrent
+        else None
+    )
 
-    # Rolling statistics over the last finished episodes, for the logs.
-    recent_milestones: deque[np.ndarray] = deque(maxlen=50)
-    best_reached = 0
+    # Rolling statistics over the last finished episodes, per title, for the logs.
+    recent_milestones = {g: deque(maxlen=50) for g in games}
+    best_reached = dict.fromkeys(games, 0)
+    # Per title: (replay path, step) of the first episode from the start that reached the goal.
+    goals: dict[str, tuple[str, int]] = {}
     global_step = 0
     first_update = 1
 
@@ -211,12 +299,25 @@ def train(cfg: Config) -> None:
     # split across several sessions and continue as if it had never stopped.
     if cfg.resume:
         saved = torch.load(cfg.resume, map_location=device)
+        saved_memory = saved.get("config", {}).get("memory", "none")
+        if saved_memory != cfg.memory:
+            raise SystemExit(
+                f"The checkpoint was trained with --memory {saved_memory}, not {cfg.memory}: "
+                "a different network. Resume it with the same --memory."
+            )
         agent.load_state_dict(saved["model"])
         if "optimizer" in saved:
             optimizer.load_state_dict(saved["optimizer"])
         global_step = saved.get("global_step", 0)
         first_update = saved.get("update", 0) + 1
-        best_reached = saved.get("best_reached", 0)
+        saved_best = saved.get("best_reached", 0)
+        if isinstance(saved_best, int):  # checkpoints from single-game runs
+            saved_best = {saved.get("config", {}).get("game", games[0]): saved_best}
+        for g in games:
+            best_reached[g] = saved_best.get(g, 0)
+        goals.update({g: tuple(v) for g, v in saved.get("goals", {}).items() if g in games})
+        if goals:
+            print("Already won: " + ", ".join(f"{g} at step {v[1]:,}" for g, v in goals.items()))
         print(f"Resumed from {cfg.resume}: step {global_step:,}, update {first_update - 1}")
         # Checkpoints saved before reward versions existed were trained with v1.
         saved_version = saved.get("config", {}).get("reward_version", "v1")
@@ -230,24 +331,37 @@ def train(cfg: Config) -> None:
     writer = SummaryWriter(str(run_dir), purge_step=global_step if cfg.resume else None)
 
     def save(path: Path, update: int) -> None:
-        _save(path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update, best_reached)
+        _save(
+            path,
+            agent,
+            optimizer,
+            cfg,
+            obs_shape,
+            n_actions,
+            global_step,
+            update,
+            best_reached,
+            goals,
+        )
 
     print(
-        f"Run '{cfg.run_name}': {cfg.num_envs} games, {num_updates} updates of {batch_size} steps, "
+        f"Run '{cfg.run_name}': {cfg.num_envs} games ({', '.join(env_games)}), "
+        f"{num_updates} updates of {batch_size} steps, "
         f"device {device}, {cfg.torch_threads} torch threads, reward {cfg.reward_version}, "
         f"archive {cfg.archive_prob:.0%}, curriculum {cfg.curriculum_prob:.0%}, "
-        f"SIL {cfg.sil_coef}, stop at goal: {cfg.stop_at_goal}, "
+        f"SIL {cfg.sil_coef}, memory {cfg.memory}, stop at goal: {cfg.stop_at_goal}, "
         f"{sum(p.numel() for p in agent.parameters()):,} parameters"
     )
 
     next_obs, _ = envs.reset(seed=cfg.seed)
     next_obs = torch.as_tensor(next_obs, device=device)
     next_done = torch.zeros(cfg.num_envs, device=device)
+    memory = agent.initial_state(cfg.num_envs, device) if recurrent else None
     start, start_step = time.time(), global_step
     deadline = start + cfg.time_limit_hours * 3600 if cfg.time_limit_hours > 0 else None
     completed = first_update - 1  # last fully completed update
 
-    goal = None  # (replay path, step) once an episode from the start reaches the goal
+    all_won = False
     try:
         play_time = learn_time = 0.0
         for update in range(first_update, num_updates + 1):
@@ -263,7 +377,13 @@ def train(cfg: Config) -> None:
                 obs_buf[t] = next_obs
                 done_buf[t] = next_done
                 with torch.inference_mode():
-                    action, logp, _, value = agent.act(next_obs)
+                    if recurrent:
+                        # A game that just ended starts a new episode: wipe its memory.
+                        memory = memory * (1.0 - next_done).unsqueeze(-1)
+                        mem_buf[t] = memory
+                        action, logp, _, value, memory = agent.act(next_obs, memory)
+                    else:
+                        action, logp, _, value = agent.act(next_obs)
                 act_buf[t], logp_buf[t], val_buf[t] = action, logp, value
 
                 obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
@@ -278,42 +398,52 @@ def train(cfg: Config) -> None:
                 if "final_info" in info:
                     for i in np.flatnonzero(info["_final_info"]):
                         final = info["final_info"]
-                        if "goal_reached" in final and final["goal_reached"][i]:
-                            goal = (str(final["replay"][i]), global_step)
+                        game = env_games[i]
+                        won = "goal_reached" in final and final["goal_reached"][i]
+                        if won and game not in goals:
+                            goals[game] = (str(final["replay"][i]), global_step)
+                            _announce_goal(
+                                game, goals[game], milestones[game], multi, run_dir, update
+                            )
+                            if multi:
+                                save(run_dir / "checkpoints" / f"winner_{game}.pt", update)
                         if highlights is not None:
-                            _add_highlight(highlights, final, i, global_step)
-                        best_reached = _log_episode(
+                            _add_highlight(highlights[game], final, i, global_step)
+                        best_reached[game] = _log_episode(
                             writer,
                             global_step,
                             info,
                             i,
-                            milestones,
-                            recent_milestones,
-                            best_reached,
+                            milestones[game],
+                            recent_milestones[game],
+                            best_reached[game],
+                            game if multi else "",
                         )
-
-                if goal is not None:
-                    break  # the final goal is reached: no need to finish this rollout
+                all_won = cfg.stop_at_goal and len(goals) == len(games)
+                if all_won:
+                    break  # every final goal is reached: no need to finish this rollout
 
             play_time += time.time() - t_play
-            if goal is not None:
-                replay, step = goal
+            if all_won:
                 save(run_dir / "checkpoints" / "winner.pt", update)
                 save(run_dir / "checkpoints" / "latest.pt", update)
-                print(f"\n*** FINAL GOAL REACHED at step {step:,}: {milestones[-1].name}! ***")
-                print(f"    replay: {replay}")
-                print(f"    model:  {run_dir / 'checkpoints' / 'winner.pt'}")
-                print(f"    watch it: uv run python scripts/replay.py {replay}")
+                won = ", ".join(f"{g} at step {goals[g][1]:,}" for g in games)
+                print(f"\n*** EVERY GOAL REACHED ({won}) ***")
+                print(f"    model: {run_dir / 'checkpoints' / 'winner.pt'}")
                 break
             if highlights is not None:
-                highlights.maybe_flush(global_step)
+                for h in highlights.values():
+                    h.maybe_flush(global_step)
             t_learn = time.time()
 
             # ------------------------------------- 2. ADVANTAGES: how good was each action?
             # GAE: compare what actually happened (rewards) with what the critic
             # expected (values). Positive advantage = better than expected.
             with torch.no_grad():
-                next_value = agent.value(next_obs)
+                if recurrent:
+                    next_value = agent.value(next_obs, memory, next_done)
+                else:
+                    next_value = agent.value(next_obs)
                 advantages = torch.zeros_like(rew_buf)
                 last_gae = torch.zeros(cfg.num_envs, device=device)
                 for t in reversed(range(cfg.num_steps)):
@@ -333,8 +463,9 @@ def train(cfg: Config) -> None:
 
             clipfracs = []
             for _ in range(cfg.update_epochs):
-                for idx in torch.randperm(batch_size, device=device).split(minibatch_size):
-                    _, new_logp, entropy, new_value = agent.act(b_obs[idx], b_act[idx])
+                for idx, new_logp, entropy, new_value in _minibatches(
+                    agent, cfg, obs_buf, act_buf, done_buf, mem_buf, minibatch_size, device
+                ):
                     ratio = (new_logp - b_logp[idx]).exp()  # new policy / old policy
                     with torch.no_grad():
                         clipfracs.append(((ratio - 1).abs() > cfg.clip_coef).float().mean().item())
@@ -367,7 +498,8 @@ def train(cfg: Config) -> None:
                 k = max(1, int(cfg.sil_store_frac * batch_size))
                 best = torch.topk(b_adv, k).indices
                 best = best[b_adv[best] > 0]
-                sil.add(b_obs[best], b_act[best], b_ret[best])
+                b_mem = mem_buf.reshape(batch_size, -1)[best] if recurrent else None
+                sil.add(b_obs[best], b_act[best], b_ret[best], b_mem)
                 sil_stats = _sil_update(agent, optimizer, sil, cfg, minibatch_size, device)
 
             learn_time += time.time() - t_learn
@@ -390,9 +522,13 @@ def train(cfg: Config) -> None:
 
             if update % 10 == 0 or update == num_updates:
                 share = play_time / (play_time + learn_time)
+                best = ", ".join(
+                    (f"{g} " if multi else "") + f"{best_reached[g]}/{len(milestones[g])}"
+                    for g in games
+                )
                 print(
                     f"update {update}/{num_updates}  steps {global_step:,}  SPS {sps}  "
-                    f"(playing {share:.0%} of the time)  best milestones {best_reached}/{len(milestones)}"
+                    f"(playing {share:.0%} of the time)  best milestones {best}"
                 )
             completed = update
             if update % cfg.checkpoint_every == 0 or update == num_updates:
@@ -413,9 +549,48 @@ def train(cfg: Config) -> None:
 
     envs.close()
     if highlights is not None:
-        highlights.close()
+        for h in highlights.values():
+            h.close()
     writer.close()
     print(f"Done. Checkpoints in {run_dir / 'checkpoints'}")
+
+
+def _minibatches(agent, cfg, obs_buf, act_buf, done_buf, mem_buf, minibatch_size, device):
+    """Yield (flat indices, log-prob, entropy, value) for each minibatch of one epoch.
+
+    Without memory, steps are independent: any random subset will do. With memory,
+    each game's steps must be replayed in order, from the memory it had at the start
+    of the rollout, so the gradient can reach back to what was remembered: the
+    minibatches are random groups of whole games.
+    """
+    steps, n_envs = act_buf.shape
+    if not agent.recurrent:
+        b_obs = obs_buf.reshape((-1, *obs_buf.shape[2:]))
+        b_act = act_buf.reshape(-1)
+        for idx in torch.randperm(steps * n_envs, device=device).split(minibatch_size):
+            _, logp, entropy, value = agent.act(b_obs[idx], b_act[idx])
+            yield idx, logp, entropy, value
+        return
+    groups = min(cfg.num_minibatches, n_envs)
+    for envs in torch.randperm(n_envs, device=device).chunk(groups):
+        logp, entropy, value = agent.act_sequence(
+            obs_buf[:, envs], mem_buf[0, envs], done_buf[:, envs], act_buf[:, envs]
+        )
+        # Flat index of (step t, game e) in the (steps * n_envs) batch: t * n_envs + e.
+        idx = (torch.arange(steps, device=device).unsqueeze(1) * n_envs + envs).reshape(-1)
+        yield idx, logp.reshape(-1), entropy.reshape(-1), value.reshape(-1)
+
+
+def _announce_goal(game, goal, milestones, multi, run_dir, update) -> None:
+    replay, step = goal
+    title = f"{game.upper()}: " if multi else ""
+    print(f"\n*** {title}FINAL GOAL REACHED at step {step:,}: {milestones[-1].name}! ***")
+    print(f"    replay: {replay}")
+    print(f"    watch it: uv run python scripts/replay.py {replay}")
+    if multi:
+        print(f"    model:  {run_dir / 'checkpoints' / f'winner_{game}.pt'} (update {update})")
+    else:
+        print(f"    model:  {run_dir / 'checkpoints' / 'winner.pt'}")
 
 
 def _add_highlight(highlights, final, i, step) -> None:
@@ -435,24 +610,29 @@ class SelfImitationBuffer:
     Kept on the CPU as uint8, so 10,000 transitions take ~170 MB of RAM.
     """
 
-    def __init__(self, capacity: int, obs_shape: tuple[int, ...]) -> None:
+    def __init__(self, capacity: int, obs_shape: tuple[int, ...], memory_size: int = 0) -> None:
         self.obs = torch.zeros((capacity, *obs_shape), dtype=torch.uint8)
         self.act = torch.zeros(capacity, dtype=torch.long)
         self.ret = torch.zeros(capacity)
+        # With memory: the memory state the agent had at that moment (as it was then).
+        self.mem = torch.zeros((capacity, memory_size)) if memory_size else None
         self.capacity, self.size, self.ptr = capacity, 0, 0
 
     def __len__(self) -> int:
         return self.size
 
-    def add(self, obs: torch.Tensor, act: torch.Tensor, ret: torch.Tensor) -> None:
-        for o, a, r in zip(obs.cpu(), act.cpu(), ret.cpu(), strict=True):
+    def add(self, obs, act, ret, mem=None) -> None:
+        for i, (o, a, r) in enumerate(zip(obs.cpu(), act.cpu(), ret.cpu(), strict=True)):
             self.obs[self.ptr], self.act[self.ptr], self.ret[self.ptr] = o, a, r
+            if self.mem is not None:
+                self.mem[self.ptr] = mem[i].cpu()
             self.ptr = (self.ptr + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
     def sample(self, n: int):
         idx = torch.randint(0, self.size, (n,))
-        return self.obs[idx], self.act[idx], self.ret[idx]
+        mem = self.mem[idx] if self.mem is not None else None
+        return self.obs[idx], self.act[idx], self.ret[idx], mem
 
 
 def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device):
@@ -467,8 +647,14 @@ def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device):
         return None
     better_frac = losses = 0.0
     for _ in range(cfg.sil_updates):
-        obs, act, ret = (t.to(device) for t in sil.sample(minibatch_size))
-        _, logp, _, value = agent.act(obs, act)
+        obs, act, ret, mem = sil.sample(minibatch_size)
+        obs, act, ret = obs.to(device), act.to(device), ret.to(device)
+        if agent.recurrent:
+            # The stored memory is the one the agent had back then: an approximation
+            # (the network has changed since), the usual one for replayed experience.
+            _, logp, _, value, _ = agent.act(obs, mem.to(device), action=act)
+        else:
+            _, logp, _, value = agent.act(obs, act)
         gap = (ret - value).clamp(min=0)  # how much better than expected, 0 if not
         policy_loss = -(logp * gap.detach()).mean()
         value_loss = 0.5 * (gap**2).mean()
@@ -482,9 +668,16 @@ def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device):
     return better_frac, losses
 
 
-def _log_episode(writer, step, info, i, milestones, recent, best_reached) -> int:
-    """Log one finished episode: return, exploration and milestones."""
+def _log_episode(writer, step, info, i, milestones, recent, best_reached, game="") -> int:
+    """Log one finished episode: return, exploration and milestones.
+
+    With several titles, curves are kept per title: "episode/red/return", ...
+    """
     final = info["final_info"]
+
+    def tag(section: str, name: str) -> str:
+        return f"{section}/{game}/{name}" if game else f"{section}/{name}"
+
     if "archive_cells" in final:
         writer.add_scalar("archive/cells", float(final["archive_cells"][i]), step)
     if "demos_active" in final:
@@ -492,46 +685,51 @@ def _log_episode(writer, step, info, i, milestones, recent, best_reached) -> int
         writer.add_scalar("curriculum/demos_completed", float(final["demos_completed"][i]), step)
     if "from_demo" in final and final["from_demo"][i]:
         # Started from a demo: not comparable with episodes from the start state.
-        writer.add_scalar("curriculum/success", float(final["demo_success"][i]), step)
-        writer.add_scalar("curriculum/demo_progress", float(final["demo_progress"][i]), step)
+        writer.add_scalar(tag("curriculum", "success"), float(final["demo_success"][i]), step)
+        writer.add_scalar(
+            tag("curriculum", "demo_progress"), float(final["demo_progress"][i]), step
+        )
         return best_reached
     if "from_archive" in final and final["from_archive"][i]:
         # Started from an archived state: useful for learning, but not comparable
         # with episodes from the start state, so kept out of the main curves.
-        writer.add_scalar("archive/episode_return", info["episode"]["r"][i], step)
-        writer.add_scalar("archive/maps_visited", float(final["maps_visited"][i]), step)
-        writer.add_scalar("archive/tiles_visited", float(final["tiles_visited"][i]), step)
+        writer.add_scalar(tag("archive", "episode_return"), info["episode"]["r"][i], step)
+        writer.add_scalar(tag("archive", "maps_visited"), float(final["maps_visited"][i]), step)
+        writer.add_scalar(tag("archive", "tiles_visited"), float(final["tiles_visited"][i]), step)
         return best_reached
-    writer.add_scalar("episode/return", info["episode"]["r"][i], step)
-    writer.add_scalar("episode/length", info["episode"]["l"][i], step)
-    writer.add_scalar("episode/tiles_visited", final["tiles_visited"][i], step)
-    writer.add_scalar("episode/maps_visited", final["maps_visited"][i], step)
-    for key in ("items_seen", "pokedex_owned", "pokedex_seen", "stagnated"):
+    writer.add_scalar(tag("episode", "return"), info["episode"]["r"][i], step)
+    writer.add_scalar(tag("episode", "length"), info["episode"]["l"][i], step)
+    writer.add_scalar(tag("episode", "tiles_visited"), final["tiles_visited"][i], step)
+    writer.add_scalar(tag("episode", "maps_visited"), final["maps_visited"][i], step)
+    for key in ("items_seen", "pokedex_owned", "pokedex_seen", "stagnated", "battle_loop"):
         if key in final:
-            writer.add_scalar(f"episode/{key}", float(final[key][i]), step)
+            writer.add_scalar(tag("episode", key), float(final[key][i]), step)
     # Return of each reward component: if one dominates, watch the agent before
     # trusting the curves. That is how reward hacking is caught.
     totals = final.get("reward_totals", {})
     for name in totals:
         if not name.startswith("_"):
-            writer.add_scalar(f"reward/{name}", float(totals[name][i]), step)
+            writer.add_scalar(tag("reward", name), float(totals[name][i]), step)
 
     reached_at = np.asarray(final["milestone_step"][i])
     recent.append(reached_at >= 0)
     rates = np.mean(recent, axis=0)
     for m, at, rate in zip(milestones, reached_at, rates, strict=True):
-        writer.add_scalar(f"milestones/{m.id}_rate", rate, step)
+        writer.add_scalar(tag("milestones", f"{m.id}_rate"), rate, step)
         if at >= 0:
-            writer.add_scalar(f"milestones/{m.id}_step", at, step)
+            writer.add_scalar(tag("milestones", f"{m.id}_step"), at, step)
 
     n_reached = int((reached_at >= 0).sum())
     if n_reached > best_reached:
         names = ", ".join(m.name for m, at in zip(milestones, reached_at, strict=True) if at >= 0)
-        print(f"  new best at step {step:,}: {n_reached} milestones ({names})")
+        where = f" in {game}" if game else ""
+        print(f"  new best{where} at step {step:,}: {n_reached} milestones ({names})")
     return max(best_reached, n_reached)
 
 
-def _save(path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update, best_reached):
+def _save(
+    path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update, best_reached, goals
+):
     """Everything needed both to watch the agent and to resume training."""
     torch.save(
         {
@@ -543,6 +741,7 @@ def _save(path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update
             "global_step": global_step,
             "update": update,
             "best_reached": best_reached,
+            "goals": goals,  # per title: (replay, step) of the first win
         },
         path,
     )

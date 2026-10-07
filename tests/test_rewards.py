@@ -261,3 +261,56 @@ def test_v22_keeps_rarity_and_passages():
     tracker = RewardTracker(C22)
     tracker.reset(S())
     assert tracker.step(S(x=1), 1)[1]["new_tile"] == pytest.approx(C22.rare_tile)
+
+
+# --- v2.2 loop breaker ------------------------------------------------------------
+
+
+def test_flee_loop_in_a_trainer_battle_ends_the_episode():
+    """A battle with no progress for too long ends the episode (the 'flee loop')."""
+    config = RewardConfig.preset("v2.2").with_weights(battle_stagnation_steps=50)
+    tracker = RewardTracker(config)
+    tracker.reset(S())
+    tracker.step(S(x=1), 1)  # progress: a new tile
+    for t in range(2, 10):
+        tracker.step(S(x=1), t)  # walking in place, no battle: only the long limit applies
+    assert not tracker.stagnant(9)
+    for t in range(10, 59):
+        tracker.step(S(x=1, in_battle=True), t)  # battle starts at step 10
+    assert not tracker.stagnant(58)
+    tracker.step(S(x=1, in_battle=True), 60)
+    assert tracker.stagnant(60)
+
+
+def test_progress_during_a_battle_restarts_the_count():
+    config = RewardConfig.preset("v2.2").with_weights(battle_stagnation_steps=50)
+    tracker = RewardTracker(config)
+    tracker.reset(S(party_levels=(5,), party_exp=(135,)))
+    for t in range(1, 40):
+        tracker.step(S(party_levels=(5,), party_exp=(135,), in_battle=True), t)
+    tracker.step(S(party_levels=(5,), party_exp=(150,), in_battle=True), 40)  # a win
+    for t in range(41, 80):
+        tracker.step(S(party_levels=(5,), party_exp=(150,), in_battle=True), t)
+    assert not tracker.stagnant(79)  # 39 steps since the win
+    assert tracker.stagnant(90)
+
+
+def test_leaving_the_battle_stops_the_battle_count():
+    config = RewardConfig.preset("v2.2").with_weights(
+        battle_stagnation_steps=50, stagnation_steps=0
+    )
+    tracker = RewardTracker(config)
+    tracker.reset(S())
+    for t in range(1, 40):
+        tracker.step(S(in_battle=True), t)
+    for t in range(40, 200):
+        tracker.step(S(), t)
+    assert not tracker.stagnant(199)
+
+
+def test_v22_preset_breaks_loops_and_earlier_versions_do_not_change():
+    v22 = RewardConfig.preset("v2.2")
+    assert (v22.stagnation_steps, v22.battle_stagnation_steps) == (5000, 1000)
+    for version in ("v2", "v2.1"):
+        assert RewardConfig.preset(version).battle_stagnation_steps == 0
+        assert RewardConfig.preset(version).stagnation_steps == 2000

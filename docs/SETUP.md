@@ -57,7 +57,7 @@ uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt --n
 uv run python training/ppo.py --total-steps 100_000_000 --seed 1 --run-name ppo_s1
 ```
 
-**Reward versions** (design in `docs/rewards.md`): `--reward-version v2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline; `--reward-version v2.1` adds exploration that wears out with use; `--reward-version v2.2` also rewards experience instead of levels, so that every battle won pays (with v2 and v2.1 the agent learned to always flee).
+**Reward versions** (design in `docs/rewards.md`): `--reward-version v2.2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline; `v2` weights maps by size and adds items and the Pokédex; `v2.1` adds exploration that wears out with use; `v2.2` rewards experience instead of levels, so that every battle won pays (with v2 and v2.1 the agent learned to always flee), and ends episodes stuck in a loop (see *Stagnation* below).
 
 To try a new reward **starting from an already trained model**, resume it into a new run, so the original stays untouched:
 
@@ -73,17 +73,29 @@ uv run python training/ppo.py ... --reward-version v2.1 --run-name v21_from_v2 -
 
 **Self-imitation learning** (`--sil-coef 1.0`): the 5% of actions of each batch that turned out much better than expected are kept in a buffer (~170 MB of RAM for 10,000), and replayed at every learning phase, but only while they are still better than what the agent now expects. A rare success is practiced instead of forgotten. Logged under `sil/*`.
 
-**Final goal and replay** (`--stop-at-goal`): training stops as soon as an episode **from the start state** reaches the last milestone (for Red: the Boulder Badge). Its replay, the start state plus every button pressed, is saved in `runs/<run-name>/replays/`, and the model in `checkpoints/winner.pt`. The emulator is deterministic, so the replay reproduces the exact game:
+**Final goal and replay** (`--stop-at-goal`): training stops as soon as an episode **from the start state** reaches the last milestone (for Red: the Boulder Badge). Its replay, the start state plus every button pressed, is saved in `runs/<run-name>/replays/`, and the model in `checkpoints/winner.pt`. With several games (see below), training stops when every game has been won at least once. The emulator is deterministic, so the replay reproduces the exact game (the ROM is chosen from the game saved in the replay):
 
 ```bash
-uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz                  # window, normal speed
-uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz --speed 4        # window, 4x
-uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz --video badge.mp4 --video-speed 4
+uv run python scripts/replay.py runs/<run>/replays/goal_red_env0_ep12.npz                  # window, normal speed
+uv run python scripts/replay.py runs/<run>/replays/goal_red_env0_ep12.npz --speed 4        # window, 4x
+uv run python scripts/replay.py runs/<run>/replays/goal_red_env0_ep12.npz --video badge.mp4 --video-speed 4
 ```
 
 Replays contain the start state, i.e. game data: keep them private, like ROMs.
 
-**Stagnation** (`--stagnation-steps`): end an episode after this many steps without progress; `0` = never, `-1` = the reward version's default.
+**Stagnation** (`--stagnation-steps`): end an episode after this many steps without progress; `0` = never, `-1` = the reward version's default (v2.2: 5,000).
+
+**Battle loops** (`--battle-stagnation-steps`): end an episode after this many steps of one battle without progress; `0` = never, `-1` = the reward version's default (v2.2: 1,000; a normal battle takes a few dozen steps). This catches the *flee loop*: an agent that learned to flee wild battles keeps choosing RUN in a trainer battle, where fleeing is impossible, forever. Ending the episode there makes the loop worth nothing, while winning the battle pays experience. Logged as `episode/battle_loop`. `watch.py` and `evaluate.py` never end episodes early, so loops stay visible.
+
+**Short-term memory** (`--memory gru`): without memory the agent decides from the last 3 frames, about one second of game, so it cannot know what is not on the screen: for example that it is carrying Oak's Parcel, which it must bring back south. With `--memory gru` the network carries a small memory (a GRU, `--memory-size 256`) from step to step, wiped at every new episode, and learns by itself what is worth remembering, over stretches of `--num-steps` steps (256 ≈ 100 s of game). Notes:
+
+- It is a different network: a model trained with memory can only be resumed with `--memory gru`, and one trained without it only without it. `watch.py` and `evaluate.py` pick the right network from the checkpoint.
+- `--num-envs` must be a multiple of `--num-minibatches` (default 4): each minibatch replays whole games, in order.
+- Episodes started from the archive or a curriculum demo start with an empty memory.
+- Self-imitation stores the memory of the moment with each replayed action (an approximation, since the network keeps changing).
+- Cost: about 25% fewer steps per second on a CPU; much less with a GPU, where learning is a small share of the time.
+
+The comparison that matters: the same run, same seed, with and without memory.
 
 **Highlights** (`--record-every 8`): GIFs of the episodes that went furthest, saved while training runs in `runs/<run-name>/gifs/` (open them with a browser). Every record-breaking episode (more milestones, then more maps, then more tiles) is saved immediately as `record_*.gif` and kept; every `--gif-every-steps` (default 10,000) the best episode of that window is saved as `best_*.gif`, keeping the last `--gif-keep` (default 20). Only episodes from the start state are recorded. Memory: about 60 MB per game with `--record-every 8` and 20,000-step episodes; GIFs are encoded in a separate process.
 
@@ -101,7 +113,7 @@ What to look at in TensorBoard:
 - `episode/tiles_visited`, `episode/maps_visited`: is the agent exploring more over time?
 - `episode/return`: total reward per episode.
 - `reward/*`: the return of each reward component. If one dominates, watch the agent before trusting the curves: that is how reward hacking is caught.
-- `episode/stagnated`: fraction of episodes ended early for lack of progress (v2).
+- `episode/stagnated`: fraction of episodes ended early for lack of progress (v2); `episode/battle_loop`: those ended stuck in a battle (v2.2).
 - `losses/entropy`: how random the policy still is. If it collapses early, the agent stops exploring.
 - `charts/SPS`: steps per second.
 
@@ -115,16 +127,23 @@ PyTorch from PyPI runs on the CPU on Windows, which is fine for this small netwo
 
 ### Kaggle
 
-`notebooks/kaggle_train.ipynb` runs training on Kaggle (GPU for learning, CPU cores for the emulators). Upload it to Kaggle, then follow the instructions in its first cell: enable GPU and Internet, add a **private** dataset with `pokemon_red.gb` and `red_start.state`, and use *Save Version → Save & Run All* for long runs. To continue a run in a new session, add the previous version's output as input and set `RESUME = True`.
+`notebooks/kaggle_train.ipynb` runs training on Kaggle (GPU for learning, CPU cores for the emulators). Upload it to Kaggle, then follow the instructions in its first cell: enable GPU and Internet, add a **private** dataset with the ROMs and start states (`pokemon_red.gb` and `red_start.state`, plus those of the other games for a multi-game run), set `GAMES`, and use *Save Version → Save & Run All* for long runs. To continue a run in a new session, add the previous version's output as input and set `RESUME = True`.
 
 On a laptop the emulators may not scale well across cores (run `scripts/diagnose_speed.py` to check): in that case use your PC for development and short tests, and Kaggle for long runs.
 
 ## Other games and transfer
 
-Supported games: `red`, `blue` (same memory as Red) and `yellow` (same maps and milestones, memory shifted by one byte; run in classic Game Boy mode so that it looks like Red). Put the ROMs in `roms/` as `pokemon_<game>.gb` (or `.gbc`), then create each start state in the game's own bedroom:
+Supported games: `red`, `blue` (same memory as Red), `yellow` (same maps and milestones, memory shifted by one byte; run in classic Game Boy mode so that it looks like Red) and `crystal` (the **held-out** test game, see `docs/research.md`: training on it is refused unless `--allow-held-out` is given). Put the ROMs in `roms/` as `pokemon_<game>.gb` (or `.gbc`), then create each start state in the game's own bedroom:
 
 ```bash
 uv run python scripts/make_start_state.py --game yellow
+uv run python scripts/make_start_state.py --game crystal   # set the clock and names, stop in the bedroom
+```
+
+**One model, several games** (`--games red,blue,yellow`): the parallel games are shared out in turn among the titles (6 games, 3 titles = 2 each, so use a multiple of the number of titles). ROMs and start states are taken from the default paths. Curves are kept per title (`milestones/red/M1_rate`, `episode/blue/return`, ...), and so are GIFs (`gifs/<game>/`). With `--stop-at-goal`, the model at the first win of each game is saved as `checkpoints/winner_<game>.pt`, and training stops when all are won (`checkpoints/winner.pt`):
+
+```bash
+uv run python training/ppo.py --games red,blue,yellow --num-envs 6 --total-steps 400_000_000 --episode-steps 30000 --archive-prob 0.3 --curriculum-prob 0.3 --sil-coef 1.0 --record-every 8 --stop-at-goal --run-name gen1_s1
 ```
 
 Evaluate any model on any game, without training on it (zero-shot), over several episodes:
@@ -132,6 +151,7 @@ Evaluate any model on any game, without training on it (zero-shot), over several
 ```bash
 uv run python scripts/evaluate.py runs/<run>/checkpoints/latest.pt --game red --episodes 10      # reference
 uv run python scripts/evaluate.py runs/<run>/checkpoints/latest.pt --game yellow --episodes 10   # transfer
+uv run python scripts/evaluate.py runs/<run>/checkpoints/winner.pt --game crystal --episodes 10   # held-out test
 ```
 
 It prints, for every milestone, the fraction of episodes that reached it and the median step. `watch.py --game yellow --checkpoint ...` shows the same model playing in a window.
@@ -140,7 +160,7 @@ It prints, for every milestone, the fraction of episodes that reached it and the
 
 - **What the agent sees:** only the screen, grayscale, downscaled to 80×72, last 3 frames stacked.
 - **What the agent does:** one of 7 buttons (down, left, right, up, A, B, Start), once every 24 frames.
-- **Rewards:** generic and the same for every game: first visit to a tile, first visit to a map, new badges, new party levels above the best seen.
+- **Rewards:** generic and the same for every game: new tiles and maps (worth less the more often they were seen), passages between maps, badges, experience, new items, the Pokédex (`docs/rewards.md`).
 - **Game adapters** (`packages/games/`) read the game memory to compute those rewards. The agent never sees this information.
 - **Milestones** (e.g. "reach Viridian City") are defined per game and used only to measure progress, never as rewards.
 
@@ -150,12 +170,12 @@ It prints, for every milestone, the fraction of episodes that reached it and the
 project-MissingNo/
 ├── packages/
 │   ├── core/            # shared types, including ProgressSignals
-│   ├── games/           # one adapter per game (red.py for now)
+│   ├── games/           # one adapter per game (red.py: Red, Blue, Yellow; crystal.py)
 │   ├── envs/            # the Gymnasium environment (PokemonEnv)
 │   └── agents/          # neural networks
 ├── training/            # training scripts (ppo.py)
 ├── notebooks/           # Kaggle notebook
-├── scripts/             # make_start_state, watch, benchmark_env
+├── scripts/             # make_start_state, watch, evaluate, replay, benchmark_env
 ├── runs/                # training logs and checkpoints (ignored by Git)
 ├── tests/
 ├── roms/                # your ROMs (ignored by Git)

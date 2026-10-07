@@ -154,3 +154,19 @@ From scratch, reward v2.2, 30,000-step episodes, archive 30%, curriculum 30%, se
 - Resume `badge_v22_s1` with the new code (the loop breaker activates by itself).
 - Create the start states of Blue, Yellow and Crystal; launch the Red + Blue + Yellow run on Kaggle.
 - Evaluate on Crystal; write the summary for the professor: replays, milestone curves, steps per milestone, cost.
+
+---
+
+## 2026-10-07 — Stuck after the parcel, and a short-term memory
+
+**What happened:** `badge_v22_s1` kept exploring (13 maps, 1,691 tiles by 1.3M steps) but stayed at 7 milestones out of 12 for over a million steps: it has Oak's Parcel and does not bring it back. An old Kaggle run (the 6-milestone code) was killed: it had nothing left to show and was eating the GPU quota.
+
+**Learned:**
+- In Generation 1 the Pokédex is not a bag item: delivering the parcel pays almost nothing directly, the parcel even disappears from the bag. The real rewards (Route 2, Viridian Forest) come later.
+- The deeper problem: **the agent cannot know it has the parcel.** It sees only the last 3 frames, and the parcel is in the bag, not on the screen. "Viridian with the parcel" and "Viridian without it" are the same picture. No reward can fix that alone.
+
+**Decided:**
+- **Short-term memory** (`--memory gru`): a GRU carried from step to step, wiped at every new episode, that learns what to remember. Same seed, with and without memory, to see if it solves the parcel.
+- Later, a **two-level memory**: the GRU plus a long-term store of a few dozen memories, written when the screen changes a lot (computed from pixels) and read by attention. Inspired by complementary learning systems, MERLIN and Neural Episodic Control.
+- Kept as options for later: an archive that restarts more often from recent progress, novelty of dialogues read from the screen, places becoming new again after a key item (with its risks: farming, toggling, touring).
+- Shorter Kaggle sessions (`TIME_LIMIT_HOURS = 4`) during development, to look at results more often.

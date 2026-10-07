@@ -212,7 +212,8 @@ class PokemonEnv(gym.Env):
             self._recording.append(self._grab_frame(downscale=1))
 
         terminated = False  # Pokémon has no "game over": only time limits
-        stagnated = self._tracker.stagnant(self._steps)
+        stop_reason = self._tracker.stop_reason(self._steps)
+        stagnated = stop_reason != ""
         max_steps = self._demo.budget() if self._demo is not None else cfg.max_steps
         if self._actions is not None and self._milestone_step[-1] >= 0:
             self._goal_reached = True  # final milestone, in an episode from the start
@@ -223,6 +224,8 @@ class PokemonEnv(gym.Env):
         info = self._info(signals, parts)
         info["demo_success"] = demo_success
         info["stagnated"] = stagnated
+        # Ended stuck in a battle (e.g. choosing RUN in a trainer battle, forever).
+        info["battle_loop"] = stop_reason == "battle"
         return self._observation(), reward, terminated, truncated, info
 
     def render(self):
@@ -344,7 +347,7 @@ def _check_rom(rom_path: str, adapter: GameAdapter) -> None:
             f"ROM not found: {rom_path}. Put your legally obtained ROM in roms/ (see docs/SETUP.md)."
         )
     sha1 = hashlib.sha1(path.read_bytes()).hexdigest()
-    if sha1 != adapter.rom_sha1:
+    if sha1 != adapter.rom_sha1 and sha1 not in getattr(adapter, "rom_sha1_alternatives", ()):
         warnings.warn(
             f"ROM SHA-1 {sha1} does not match the expected {adapter.rom_sha1} for "
             f"'{adapter.name}'. Memory addresses may be wrong for this version.",

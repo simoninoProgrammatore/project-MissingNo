@@ -89,16 +89,12 @@ Self-supervised pre-training of the visual encoder on frames collected by the ag
 
 ### 5.3 Games and held-out protocol
 
-Most games have a near-identical twin (Red/Blue, Gold/Silver, Ruby/Sapphire, FireRed/LeafGreen), so the eleven games contain about seven distinct ones. The proposed split, to be fixed before Phase 3:
+Most games have a near-identical twin (Red/Blue, Gold/Silver, Ruby/Sapphire, FireRed/LeafGreen), so the eleven games contain about seven distinct ones. The split, **held out by generation**:
 
-- **Training:** Red (Gen 1), Crystal (Gen 2), Ruby (Gen 3).
-- **Held-out ladder**, from easiest to hardest:
-  1. **Twins** (Blue, Gold/Silver, Sapphire, LeafGreen): sanity checks.
-  2. **Yellow:** same region as Red, different story details.
-  3. **FireRed:** same story as Red, different console, graphics and engine.
-  4. **Emerald:** a Generation 3 game related to Ruby, used to test transfer within a generation.
+- **Training:** Generation 1 (Red, Blue, Yellow) and, later, Generation 3 (FireRed, which bridges the two by retelling Red on a new console, and Emerald).
+- **Held out:** Generation 2 (**Crystal**, and Gold/Silver as twins). Never trained on: the code refuses to train on it unless an explicit flag is given, so the test cannot be contaminated by mistake. It sits between the two training generations, so it asks a fair question: does what was learned on both sides transfer to the generation in between?
 
-A stricter variant, run if resources allow: train on Generations 1–2 only and test on Generation 3 (new console, new world, new mechanics).
+Same-generation tests (Yellow for a model trained on Red alone) are kept as sanity checks: they look almost identical, so success there is weak evidence of generalization.
 
 ---
 
@@ -114,6 +110,10 @@ Each phase answers a question and produces a result that stands on its own.
 | **4 — Full games** | Main question | ISCRA-B / EuroHPC | Agent completing games | — |
 
 If a gate is not met, we stop, analyse why, and revise the approach before spending more compute.
+
+**Memory experiment.** The first long run stopped after Oak's Parcel: the next step is to bring it back south, and a memoryless agent cannot know it is carrying it (it is not on the screen). The planned comparison, same configuration and seed: no memory, short-term memory (GRU), and later a two-level memory (a GRU plus an episodic store of a few dozen "memories" written when the screen changes a lot and read by attention, in the spirit of complementary learning systems, MERLIN and Neural Episodic Control). Which memory does what is a result in itself.
+
+**First review milestone** (between Phases 1 and 3, on own PC and Kaggle): **one model, trained on Red, Blue and Yellow together, that wins the first badge in all three**, with a replay of each first win, plus its zero-shot score on Crystal milestone by milestone. It answers RQ1 on a real goal (a badge, not just a map), gives a first measured cost per badge, and the first number on generalization to an unseen generation.
 
 ### 6.1 Phase 1 in detail
 

@@ -3,12 +3,14 @@
 Plays N episodes without a window and prints, for each milestone, the fraction of
 episodes that reached it and the median step at which it was reached. This is
 how we test transfer: a model trained on Red, evaluated on Blue or Yellow
-without any training on them (zero-shot).
+without any training on them (zero-shot), and how we score the held-out game
+(Crystal) for a model trained on Generation 1.
 
 Usage:
     uv run python scripts/evaluate.py runs/badge_v22_s1/checkpoints/winner.pt --game yellow
     uv run python scripts/evaluate.py <checkpoint> --game red --episodes 20 --steps 30000
     uv run python scripts/evaluate.py <checkpoint> --game yellow --greedy
+    uv run python scripts/evaluate.py runs/gen1_s1/checkpoints/winner.pt --game crystal  # held-out test
 """
 
 import argparse
@@ -17,23 +19,20 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from make_start_state import default_rom
-from missingno_agents import CnnActorCritic
+from missingno_agents import Policy
 from missingno_envs import EnvConfig, PokemonEnv, RewardConfig
-from missingno_games import ADAPTERS
+from missingno_games import ADAPTERS, default_rom, default_state
 
 
 def main(args) -> None:
-    data = torch.load(args.checkpoint, map_location="cpu")
-    agent = CnnActorCritic(tuple(data["obs_shape"]), data["n_actions"])
-    agent.load_state_dict(data["model"])
-    agent.eval()
     torch.set_num_threads(args.torch_threads)
-    trained_on = data.get("config", {}).get("game", "?")
-    reward_version = data.get("config", {}).get("reward_version", "v2")
+    policy = Policy(args.checkpoint, args.greedy)  # with or without memory, as it was trained
+    config = policy.config
+    trained_on = config.get("games") or config.get("game", "?")
+    reward_version = config.get("reward_version", "v2")
 
     rom = args.rom or default_rom(args.game)
-    state = args.state or f"states/{args.game}_start.state"
+    state = args.state or default_state(args.game)
     if not Path(state).exists():
         raise SystemExit(
             f"No start state at {state}: create it with "
@@ -44,7 +43,11 @@ def main(args) -> None:
             rom_path=rom,
             start_state_path=state,
             max_steps=args.steps,
-            rewards=RewardConfig.preset(reward_version),
+            # No stagnation stop: an evaluation gives the agent its whole time budget.
+            rewards=RewardConfig.preset(reward_version).with_weights(
+                stagnation_steps=args.stagnation_steps,
+                battle_stagnation_steps=args.battle_stagnation_steps,
+            ),
         ),
         ADAPTERS[args.game](),
     )
@@ -59,10 +62,9 @@ def main(args) -> None:
     for ep in range(args.episodes):
         start = time.time()
         obs, _ = env.reset(seed=args.seed + ep)
+        policy.reset()  # a new episode: wipe the memory, if the model has one
         for _ in range(args.steps):
-            with torch.inference_mode():
-                action, *_ = agent.act(torch.as_tensor(obs).unsqueeze(0), greedy=args.greedy)
-            obs, _, terminated, truncated, info = env.step(int(action.item()))
+            obs, _, terminated, truncated, info = env.step(policy(obs))
             if terminated or truncated:
                 break
         reached[ep] = info["milestone_step"]
@@ -95,5 +97,17 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=20_000, help="max steps per episode")
     parser.add_argument("--greedy", action="store_true", help="always pick the most likely button")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--stagnation-steps",
+        type=int,
+        default=0,
+        help="end an episode after N steps without progress; 0 = never",
+    )
+    parser.add_argument(
+        "--battle-stagnation-steps",
+        type=int,
+        default=0,
+        help="end an episode after N steps of a battle without progress; 0 = never",
+    )
     parser.add_argument("--torch-threads", type=int, default=2)
     main(parser.parse_args())

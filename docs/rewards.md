@@ -192,6 +192,13 @@ If an episode produces **no extrinsic progress and no new tile for K steps** (st
 
 Loops this catches: door ping-pong, menu spam, walking against a wall, oscillating at a ledge, circling a Pokémon Center.
 
+In practice K = 2,000 also cut good episodes short (the lab, before the first battle), so the long runs used no limit at all, and paid for it with the **flee loop**: an agent that learned to flee wild battles meets its first trainer, chooses RUN, reads "no running from a trainer battle", and chooses RUN again, for the rest of a 30,000-step episode. v2.2 therefore uses two limits:
+
+- **5,000 steps without any progress**, anywhere: generous enough for the lab, still a cap on dead episodes;
+- **1,000 steps of one battle without any progress**: a battle normally takes a few dozen steps, and every won battle is progress (experience), so this only fires on a loop. The battle state is read from the game, like the map: a concept every game has, not knowledge of a specific fight.
+
+Since time-limit ends are treated as real ends (no value after them), a loop that is cut after 1,000 steps is worth nothing, while fighting is worth experience, and the gap falls within the agent's horizon (§4).
+
 ---
 
 ## 7. Corruption guard

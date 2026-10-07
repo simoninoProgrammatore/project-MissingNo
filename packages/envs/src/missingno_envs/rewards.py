@@ -25,6 +25,12 @@ Versions:
        sooner). Experience points grow after every battle won, so every win is
        rewarded right away. Still concave and max-so-far: grinding forever, or
        depositing and re-withdrawing Pokémon, does not pay.
+       v2.2 also breaks loops: an episode ends after 5000 steps without any
+       progress, or after 1000 steps of a battle without any progress. The
+       second one catches the "flee loop": a policy that learned to flee wild
+       battles keeps choosing RUN in a trainer battle, where fleeing is
+       impossible, forever. Ending the episode there makes the loop worth
+       nothing, while winning the battle pays experience.
 """
 
 from __future__ import annotations
@@ -84,6 +90,9 @@ class RewardConfig:
     dex_owned_scale: float = 20.0  # owned species reward decays as 1/sqrt(1 + owned/scale)
     dex_seen: float = 0.05
     stagnation_steps: int = 2000  # 0 = never truncate for lack of progress
+    # End the episode after this many steps of one battle without any progress
+    # (a battle normally takes a few dozen steps). 0 = off.
+    battle_stagnation_steps: int = 0
     # v2.1 only: rewards that decay with how many past episodes already had them
     rare_tile: float = 0.1  # a never-visited tile; after n episodes it is worth rare_tile/sqrt(n)
     passage: float = 0.2  # a never-crossed passage between maps, in one direction
@@ -99,8 +108,10 @@ class RewardConfig:
         if version == "v1":
             # Exactly the Phase 1 baseline.
             return cls(version="v1", badge=5.0, stagnation_steps=0)
-        if version in ("v2", "v2.1", "v2.2"):
+        if version in ("v2", "v2.1"):
             return cls(version=version)
+        if version == "v2.2":
+            return cls(version=version, stagnation_steps=5000, battle_stagnation_steps=1000)
         raise ValueError(f"Unknown reward version {version!r}: choose from {sorted(COMPONENTS)}")
 
     def with_weights(self, **weights: float) -> RewardConfig:
@@ -157,11 +168,16 @@ class RewardTracker:
         self.best_owned = s.pokedex_owned
         self.best_seen = s.pokedex_seen
         self.last_progress_step = 0
+        self.battle_start: int | None = 0 if s.in_battle else None
         self.totals = dict.fromkeys(self.components, 0.0)
 
     def step(self, s: ProgressSignals, step: int) -> tuple[float, dict[str, float]]:
         c = self.config
         parts: dict[str, float] = {}
+        if not s.in_battle:
+            self.battle_start = None
+        elif self.battle_start is None:
+            self.battle_start = step
 
         if s.cell not in self.visited_tiles:
             self.visited_tiles.add(s.cell)
@@ -243,5 +259,15 @@ class RewardTracker:
         We end the episode instead of punishing the agent: penalties teach it to
         stand still, or to end episodes on purpose.
         """
-        k = self.config.stagnation_steps
-        return k > 0 and step - self.last_progress_step >= k
+        return self.stop_reason(step) != ""
+
+    def stop_reason(self, step: int) -> str:
+        """Why the episode should end: "battle" (stuck in a battle), "no_progress", or ""."""
+        c = self.config
+        if c.battle_stagnation_steps > 0 and self.battle_start is not None:
+            since = max(self.battle_start, self.last_progress_step)
+            if step - since >= c.battle_stagnation_steps:
+                return "battle"
+        if c.stagnation_steps > 0 and step - self.last_progress_step >= c.stagnation_steps:
+            return "no_progress"
+        return ""

@@ -19,17 +19,8 @@ Usage:
 import argparse
 from pathlib import Path
 
-from missingno_games import ADAPTERS
+from missingno_games import ADAPTERS, default_rom, default_state
 from pyboy import PyBoy
-
-
-def default_rom(game: str) -> str:
-    """roms/pokemon_<game>.gb, or .gbc if that is the file you have."""
-    for ext in (".gb", ".gbc"):
-        path = Path(f"roms/pokemon_{game}{ext}")
-        if path.exists():
-            return str(path)
-    return f"roms/pokemon_{game}.gb"
 
 
 def main(game: str, rom: str, out: str) -> None:
@@ -54,6 +45,4 @@ if __name__ == "__main__":
     parser.add_argument("--rom", help="default: roms/pokemon_<game>.gb (or .gbc)")
     parser.add_argument("--out", help="default: states/<game>_start.state")
     args = parser.parse_args()
-    main(
-        args.game, args.rom or default_rom(args.game), args.out or f"states/{args.game}_start.state"
-    )
+    main(args.game, args.rom or default_rom(args.game), args.out or default_state(args.game))

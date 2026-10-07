@@ -7,7 +7,7 @@ game exactly. This script plays it in a window at normal speed, or exports it as
 a video.
 
 Usage:
-    uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz              # window, normal speed
+    uv run python scripts/replay.py runs/<run>/replays/goal_red_env0_ep12.npz          # window, normal speed
     uv run python scripts/replay.py <replay> --speed 4                                  # window, 4x
     uv run python scripts/replay.py <replay> --video badge.mp4                          # video, normal speed
     uv run python scripts/replay.py <replay> --video badge_4x.mp4 --video-speed 4       # shorter video
@@ -18,7 +18,7 @@ import io
 
 import numpy as np
 from missingno_envs import ACTIONS
-from missingno_games import ADAPTERS
+from missingno_games import ADAPTERS, default_rom
 from pyboy import PyBoy
 
 
@@ -32,7 +32,10 @@ def main(args) -> None:
     adapter = ADAPTERS[game]() if game in ADAPTERS else None
 
     window = "null" if args.video else "SDL2"
-    pyboy = PyBoy(args.rom, window=window, sound_emulated=False)
+    rom = args.rom or default_rom(game)
+    # Same emulator mode as in training (e.g. Yellow in classic Game Boy mode).
+    cgb = getattr(adapter, "cgb", None)
+    pyboy = PyBoy(rom, window=window, sound_emulated=False, cgb=cgb)
     pyboy.set_emulation_speed(0 if args.video else args.speed)
     pyboy.load_state(io.BytesIO(data["start_state"].tobytes()))
     pyboy.tick(1, True)
@@ -85,7 +88,7 @@ if __name__ == "__main__":
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("replay", help="replay file (.npz) saved by training")
-    parser.add_argument("--rom", default="roms/pokemon_red.gb")
+    parser.add_argument("--rom", help="default: the replay's game, roms/pokemon_<game>.gb")
     parser.add_argument(
         "--speed", type=int, default=1, help="window speed: 1 = normal, 0 = unlimited"
     )
