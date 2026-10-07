@@ -4,21 +4,37 @@ The intro (choosing names, the opening speech) is setup, not gameplay: we play i
 once by hand so every training episode starts in the bedroom. This is not a
 demonstration and is never used as training data.
 
+The state is created with the same emulator mode the environment uses for that
+game (e.g. Yellow in classic Game Boy mode), otherwise it could not be loaded.
+
 Controls (PyBoy defaults): arrows = D-pad, A = a, S = b, Enter = Start,
 Backspace = Select.
 
 Usage:
-    uv run python scripts/make_start_state.py --rom roms/pokemon_red.gb --out states/red_start.state
+    uv run python scripts/make_start_state.py                          # Red
+    uv run python scripts/make_start_state.py --game yellow            # Yellow
+    uv run python scripts/make_start_state.py --game yellow --rom roms/my_yellow.gbc
 """
 
 import argparse
 from pathlib import Path
 
+from missingno_games import ADAPTERS
 from pyboy import PyBoy
 
 
-def main(rom: str, out: str) -> None:
-    pyboy = PyBoy(rom, window="SDL2", sound_emulated=False)
+def default_rom(game: str) -> str:
+    """roms/pokemon_<game>.gb, or .gbc if that is the file you have."""
+    for ext in (".gb", ".gbc"):
+        path = Path(f"roms/pokemon_{game}{ext}")
+        if path.exists():
+            return str(path)
+    return f"roms/pokemon_{game}.gb"
+
+
+def main(game: str, rom: str, out: str) -> None:
+    cgb = getattr(ADAPTERS[game], "cgb", None)
+    pyboy = PyBoy(rom, window="SDL2", sound_emulated=False, cgb=cgb)
     pyboy.set_emulation_speed(1)
     print("Play until you are in control in the bedroom, then CLOSE THE WINDOW to save.")
     while pyboy.tick():
@@ -34,7 +50,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--rom", default="roms/pokemon_red.gb")
-    parser.add_argument("--out", default="states/red_start.state")
+    parser.add_argument("--game", default="red", choices=ADAPTERS)
+    parser.add_argument("--rom", help="default: roms/pokemon_<game>.gb (or .gbc)")
+    parser.add_argument("--out", help="default: states/<game>_start.state")
     args = parser.parse_args()
-    main(args.rom, args.out)
+    main(
+        args.game, args.rom or default_rom(args.game), args.out or f"states/{args.game}_start.state"
+    )

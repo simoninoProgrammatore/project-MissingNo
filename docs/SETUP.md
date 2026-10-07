@@ -119,6 +119,23 @@ PyTorch from PyPI runs on the CPU on Windows, which is fine for this small netwo
 
 On a laptop the emulators may not scale well across cores (run `scripts/diagnose_speed.py` to check): in that case use your PC for development and short tests, and Kaggle for long runs.
 
+## Other games and transfer
+
+Supported games: `red`, `blue` (same memory as Red) and `yellow` (same maps and milestones, memory shifted by one byte; run in classic Game Boy mode so that it looks like Red). Put the ROMs in `roms/` as `pokemon_<game>.gb` (or `.gbc`), then create each start state in the game's own bedroom:
+
+```bash
+uv run python scripts/make_start_state.py --game yellow
+```
+
+Evaluate any model on any game, without training on it (zero-shot), over several episodes:
+
+```bash
+uv run python scripts/evaluate.py runs/<run>/checkpoints/latest.pt --game red --episodes 10      # reference
+uv run python scripts/evaluate.py runs/<run>/checkpoints/latest.pt --game yellow --episodes 10   # transfer
+```
+
+It prints, for every milestone, the fraction of episodes that reached it and the median step. `watch.py --game yellow --checkpoint ...` shows the same model playing in a window.
+
 ## How the environment works
 
 - **What the agent sees:** only the screen, grayscale, downscaled to 80×72, last 3 frames stacked.

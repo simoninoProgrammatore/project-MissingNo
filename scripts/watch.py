@@ -104,8 +104,8 @@ if __name__ == "__main__":
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("--game", default="red", choices=ADAPTERS)
-    parser.add_argument("--rom", default="roms/pokemon_red.gb")
-    parser.add_argument("--state", default="states/red_start.state")
+    parser.add_argument("--rom", help="default: roms/pokemon_<game>.gb (or .gbc)")
+    parser.add_argument("--state", help="default: states/<game>_start.state")
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--speed", type=int, default=4, help="1 = real time, 0 = unlimited")
     parser.add_argument("--checkpoint", help="trained model (.pt); omit for a random agent")
@@ -116,6 +116,10 @@ if __name__ == "__main__":
     parser.add_argument("--gif", help="save the episode as a GIF at this path")
     parser.add_argument("--gif-every", type=int, default=2, help="keep one frame every N steps")
     args = parser.parse_args()
+    from make_start_state import default_rom
+
+    args.rom = args.rom or default_rom(args.game)
+    args.state = args.state or f"states/{args.game}_start.state"
     if args.checkpoint and not Path(args.checkpoint).exists():
         available = sorted(str(p) for p in Path("runs").glob("*/checkpoints/*.pt"))
         print(f"Checkpoint not found: {args.checkpoint}")

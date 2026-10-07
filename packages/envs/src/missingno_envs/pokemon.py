@@ -107,7 +107,10 @@ class PokemonEnv(gym.Env):
 
         _check_rom(config.rom_path, adapter)
         window = "SDL2" if render_mode == "human" else "null"
-        self.pyboy = PyBoy(config.rom_path, window=window, sound_emulated=False)
+        # Some adapters force the classic Game Boy mode (e.g. Yellow), see games/red.py.
+        self.pyboy = PyBoy(
+            config.rom_path, window=window, sound_emulated=False, cgb=getattr(adapter, "cgb", None)
+        )
         # 0 = as fast as possible; 1 = real time (only useful when watching)
         self.pyboy.set_emulation_speed(emulation_speed if render_mode == "human" else 0)
 

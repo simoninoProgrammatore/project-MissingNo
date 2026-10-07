@@ -1,4 +1,7 @@
-"""Adapter for Pokémon Red (international version).
+"""Adapters for the Generation 1 games: Red, Blue (same memory) and Yellow.
+
+Yellow uses the same maps, items and milestones as Red, but every address in its
+work RAM is shifted one byte lower (verified on pret/pokeyellow's symbol file).
 
 Memory addresses come from the community disassembly of the game (pret/pokered)
 and are the same ones used by earlier Pokémon Red RL projects.
@@ -107,12 +110,26 @@ MILESTONES: tuple[Milestone, ...] = (
 )
 
 
+class _Shifted:
+    """Memory view with every address moved by `offset` (Yellow: -1)."""
+
+    def __init__(self, memory: Memory, offset: int) -> None:
+        self.memory, self.offset = memory, offset
+
+    def __getitem__(self, address: int) -> int:
+        return self.memory[address + self.offset]
+
+
 class RedAdapter:
     name = "red"
     rom_sha1 = "ea9bcae617fdf159b045185467ae58b2e4a48b9a"
     milestones = MILESTONES
+    offset = 0  # address shift relative to Red
+    cgb: bool | None = None  # None = let the emulator decide; False = force the classic Game Boy
 
     def read(self, memory: Memory) -> ProgressSignals:
+        if self.offset:
+            memory = _Shifted(memory, self.offset)
         party_count = min(memory[PARTY_COUNT], 6)
         levels = tuple(memory[address] for address in PARTY_LEVELS[:party_count])
         n_items = min(memory[NUM_BAG_ITEMS], BAG_CAPACITY)
@@ -131,6 +148,29 @@ class RedAdapter:
             pokedex_seen=_count_bits(memory, POKEDEX_SEEN, POKEDEX_BYTES),
             party_exp=tuple(_read_exp(memory, i) for i in range(party_count)),
         )
+
+
+class BlueAdapter(RedAdapter):
+    """Blue: the same memory, maps and milestones as Red; a few different Pokémon."""
+
+    name = "blue"
+    rom_sha1 = "d7037c83e1ae5b39bde3c30787637ba1d4c48ce2"
+
+
+class YellowAdapter(RedAdapter):
+    """Yellow: same maps, items and milestones as Red, memory shifted by one byte.
+
+    Yellow is a Game Boy Color game that also runs on the classic Game Boy. We
+    force the classic mode, so that it looks like Red (same gray shades): when
+    testing a model trained on Red, the differences are the game's, not the
+    colours. Start states must be created in the same mode (make_start_state.py
+    --game yellow does it).
+    """
+
+    name = "yellow"
+    rom_sha1 = "cc7d03262ebfaf2f06772c1a480c7d9d5f4a38e1"
+    offset = -1
+    cgb = False
 
 
 def _read_exp(memory: Memory, slot: int) -> int:

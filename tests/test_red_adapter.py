@@ -94,3 +94,24 @@ def test_reads_party_experience():
     second = R.PARTY_EXP + R.PARTY_MON_SIZE
     mem[second], mem[second + 1], mem[second + 2] = 0x01, 0x00, 0x00  # 65536
     assert RedAdapter().read(mem).party_exp == (300, 65536)
+
+
+def test_yellow_reads_the_same_signals_one_byte_lower():
+    from missingno_games import YellowAdapter
+
+    mem = FakeMemory()
+    for red_address, value in [(R.MAP_ID, 40), (R.PLAYER_X, 3), (R.PLAYER_Y, 4), (R.BADGES, 1)]:
+        mem[red_address - 1] = value
+    mem[R.PARTY_COUNT - 1] = 1
+    mem[R.PARTY_LEVELS[0] - 1] = 5
+    s = YellowAdapter().read(mem)
+    assert (s.cell, s.badges, s.party_levels) == ((40, 3, 4), 1, (5,))
+    assert YellowAdapter.cgb is False and YellowAdapter.milestones == R.MILESTONES
+
+
+def test_blue_is_red():
+    from missingno_games import BlueAdapter
+
+    mem = FakeMemory()
+    mem[R.MAP_ID] = 12
+    assert BlueAdapter().read(mem).map_id == RedAdapter().read(mem).map_id == 12
