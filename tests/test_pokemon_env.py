@@ -13,7 +13,7 @@ import pyboy
 import pytest
 from gymnasium.utils.env_checker import check_env
 from missingno_core import ProgressSignals
-from missingno_envs import EnvConfig, PokemonEnv
+from missingno_envs import EnvConfig, PokemonEnv, RewardConfig
 from missingno_games import Milestone
 
 TEST_ROM = os.path.join(os.path.dirname(pyboy.__file__), "default_rom.gb")
@@ -63,7 +63,7 @@ def test_observation_shape_and_type():
     env.close()
 
 
-def test_generic_rewards():
+def test_v1_rewards_are_unchanged():
     seq = [
         ProgressSignals(map_id=0, x=0, y=0, party_levels=(5,)),  # reset
         ProgressSignals(map_id=0, x=1, y=0, party_levels=(5,)),  # new tile
@@ -74,12 +74,12 @@ def test_generic_rewards():
         ProgressSignals(map_id=1, x=0, y=0, party_levels=(7,)),  # back to 7: no reward
         ProgressSignals(map_id=1, x=0, y=0, badges=1, party_levels=(7,)),  # badge
     ]
-    env = make_env(seq)
+    env = make_env(seq, rewards=RewardConfig.preset("v1"))
     r = env.rewards
     env.reset(seed=0)
     rewards = [env.step(0)[1] for _ in range(len(seq) - 1)]
     assert rewards == pytest.approx(
-        [r.new_tile, 0, r.new_tile + r.new_map, 2 * r.level, 0, 0, r.badge]
+        [r.new_tile, 0, r.new_tile + r.new_map_flat, 2 * r.level, 0, 0, r.badge]
     )
     env.close()
 
@@ -114,4 +114,23 @@ def test_milestones_record_first_step_reached():
     # (the scripted adapter now returns a state that already has a badge).
     _, info = env.reset(seed=0)
     assert info["milestone_step"].tolist() == [-1, 0]
+    env.close()
+
+
+def test_stagnation_truncates_the_episode():
+    still = ProgressSignals(map_id=0, x=0, y=0)
+    env = make_env([still], rewards=RewardConfig.preset("v2").with_weights(stagnation_steps=3))
+    env.reset(seed=0)
+    flags = [env.step(0)[3] for _ in range(3)]
+    assert flags == [False, False, True]
+    env.close()
+
+
+def test_info_reports_reward_totals():
+    seq = [ProgressSignals(map_id=0, x=0, y=0), ProgressSignals(map_id=0, x=1, y=0)]
+    env = make_env(seq)
+    env.reset(seed=0)
+    *_, info = env.step(0)
+    assert info["reward_totals"]["new_tile"] == pytest.approx(env.rewards.new_tile)
+    assert set(info["reward_totals"]) == set(env._tracker.components)
     env.close()

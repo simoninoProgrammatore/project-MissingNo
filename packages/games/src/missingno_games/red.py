@@ -3,9 +3,12 @@
 Memory addresses come from the community disassembly of the game (pret/pokered)
 and are the same ones used by earlier Pokémon Red RL projects.
 
-Only generic progress is read: where the player is, badges, party levels,
-whether a battle is in progress. No story events, no game-specific flags:
-those would be "walkthrough" knowledge, which this project does not use.
+Only generic progress is read: where the player is, map size, badges, party
+levels, whether a battle is in progress, items in the bag, Pokédex counts.
+No story events, no game-specific flags: those would be "walkthrough"
+knowledge, which this project does not use.
+
+All addresses are verified against pret/pokered's symbol file (pokered.sym).
 """
 
 from missingno_core import ProgressSignals
@@ -20,6 +23,54 @@ BADGES = 0xD356  # bitfield, one bit per badge
 PARTY_COUNT = 0xD163
 PARTY_LEVELS = (0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268)
 IS_IN_BATTLE = 0xD057  # 0 = no battle, 1 = wild, 2 = trainer, 0xFF = just lost
+MAP_HEIGHT = 0xD368  # in blocks; one block = 2x2 player steps
+MAP_WIDTH = 0xD369
+NUM_BAG_ITEMS = 0xD31D
+BAG_ITEMS = 0xD31E  # (item id, quantity) pairs, up to 20
+BAG_CAPACITY = 20
+POKEDEX_OWNED = 0xD2F7  # 19-byte bit arrays, one bit per species
+POKEDEX_SEEN = 0xD30A
+POKEDEX_BYTES = 19
+
+# Items the game itself marks as key items: derived from the game's own
+# KeyItemFlags table (pret/pokered data/items/key_items.asm), plus the HMs
+# ($C4-$C8), which can never be bought. "Key item" is a concept every
+# Generation 1-3 game has, so rewarding it is not walkthrough knowledge.
+KEY_ITEMS: frozenset[int] = frozenset(
+    (
+        0x05,
+        0x06,
+        0x07,
+        0x08,
+        0x09,
+        0x15,
+        0x16,
+        0x17,
+        0x18,
+        0x19,
+        0x1A,
+        0x1B,
+        0x1C,
+        0x1F,
+        0x29,
+        0x2A,
+        0x2B,
+        0x2C,
+        0x2D,
+        0x30,
+        0x3F,
+        0x40,
+        0x45,
+        0x46,
+        0x47,
+        0x48,
+        0x49,
+        0x4A,
+        0x4C,
+        0x4D,
+        0x4E,
+    )
+) | frozenset(range(0xC4, 0xC9))
 
 # Map IDs (pret/pokered constants). 37 and 38 verified in our first run.
 PALLET_TOWN = 0
@@ -48,6 +99,8 @@ class RedAdapter:
     def read(self, memory: Memory) -> ProgressSignals:
         party_count = min(memory[PARTY_COUNT], 6)
         levels = tuple(memory[address] for address in PARTY_LEVELS[:party_count])
+        n_items = min(memory[NUM_BAG_ITEMS], BAG_CAPACITY)
+        items = frozenset(memory[BAG_ITEMS + 2 * i] for i in range(n_items))
         return ProgressSignals(
             map_id=memory[MAP_ID],
             x=memory[PLAYER_X],
@@ -55,4 +108,13 @@ class RedAdapter:
             badges=memory[BADGES].bit_count(),
             party_levels=levels,
             in_battle=memory[IS_IN_BATTLE] in (1, 2),
+            map_area=4 * memory[MAP_HEIGHT] * memory[MAP_WIDTH],
+            items=items,
+            key_items=items & KEY_ITEMS,
+            pokedex_owned=_count_bits(memory, POKEDEX_OWNED, POKEDEX_BYTES),
+            pokedex_seen=_count_bits(memory, POKEDEX_SEEN, POKEDEX_BYTES),
         )
+
+
+def _count_bits(memory: Memory, start: int, n_bytes: int) -> int:
+    return sum(memory[start + i].bit_count() for i in range(n_bytes))

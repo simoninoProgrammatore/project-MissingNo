@@ -1,6 +1,6 @@
 """Gymnasium environment for Pokémon games running in PyBoy.
 
-Design rules (see docs/plan.md):
+Design rules (see docs/research.md and docs/rewards.md):
 - The agent observes ONLY the screen (grayscale, downscaled, last frames stacked).
 - Rewards are generic and identical for every game, computed from the progress
   signals read by a game adapter. The adapter never feeds the agent.
@@ -24,18 +24,10 @@ from missingno_core import ProgressSignals
 from missingno_games import GameAdapter
 from pyboy import PyBoy
 
+from missingno_envs.rewards import RewardConfig, RewardTracker
+
 # The agent's buttons. SELECT is left out: it is almost never needed.
 ACTIONS: tuple[str, ...] = ("down", "left", "right", "up", "a", "b", "start")
-
-
-@dataclass
-class RewardConfig:
-    """Weights of the generic rewards. Same for every game."""
-
-    new_tile: float = 0.02  # first visit to a tile
-    new_map: float = 0.5  # first visit to a map (town, route, building, ...)
-    badge: float = 5.0  # each new badge
-    level: float = 0.2  # each new party level above the best seen so far
 
 
 @dataclass
@@ -47,7 +39,7 @@ class EnvConfig:
     downscale: int = 2  # 160x144 -> 80x72
     frame_stack: int = 3
     max_steps: int = 10_000  # episode length in agent steps
-    rewards: RewardConfig | None = None
+    rewards: RewardConfig | None = None  # None = the current default version (v2)
 
 
 class PokemonEnv(gym.Env):
@@ -64,6 +56,7 @@ class PokemonEnv(gym.Env):
         self.config = config
         self.adapter = adapter
         self.rewards = config.rewards or RewardConfig()
+        self._tracker = RewardTracker(self.rewards)
         self.render_mode = render_mode
 
         _check_rom(config.rom_path, adapter)
@@ -88,10 +81,6 @@ class PokemonEnv(gym.Env):
         self.action_space = spaces.Discrete(len(ACTIONS))
 
         self._frames: deque[np.ndarray] = deque(maxlen=config.frame_stack)
-        self._visited_tiles: set[tuple[int, int, int]] = set()
-        self._visited_maps: set[int] = set()
-        self._best_badges = 0
-        self._best_total_level = 0
         self._steps = 0
         # Step at which each milestone was first reached in this episode (-1 = not yet).
         self._milestone_step = np.full(len(adapter.milestones), -1, dtype=np.int64)
@@ -104,10 +93,7 @@ class PokemonEnv(gym.Env):
         self.pyboy.tick(1, True)
 
         signals = self.adapter.read(self.pyboy.memory)
-        self._visited_tiles = {signals.cell}
-        self._visited_maps = {signals.map_id}
-        self._best_badges = signals.badges
-        self._best_total_level = signals.total_level
+        self._tracker.reset(signals)
         self._steps = 0
         self._milestone_step[:] = -1
         self._update_milestones(signals)
@@ -128,13 +114,16 @@ class PokemonEnv(gym.Env):
         self._steps += 1
 
         signals = self.adapter.read(self.pyboy.memory)
-        reward, parts = self._reward(signals)
+        reward, parts = self._tracker.step(signals, self._steps)
         self._update_milestones(signals)
         self._frames.append(self._grab_frame())
 
         terminated = False  # Pokémon has no "game over": only time limits
-        truncated = self._steps >= cfg.max_steps
-        return self._observation(), reward, terminated, truncated, self._info(signals, parts)
+        stagnated = self._tracker.stagnant(self._steps)
+        truncated = self._steps >= cfg.max_steps or stagnated
+        info = self._info(signals, parts)
+        info["stagnated"] = stagnated
+        return self._observation(), reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode == "rgb_array":
@@ -145,25 +134,6 @@ class PokemonEnv(gym.Env):
         self.pyboy.stop(save=False)
 
     # ------------------------------------------------------------ internals
-
-    def _reward(self, s: ProgressSignals) -> tuple[float, dict[str, float]]:
-        r = self.rewards
-        parts: dict[str, float] = {}
-        if s.cell not in self._visited_tiles:
-            self._visited_tiles.add(s.cell)
-            parts["new_tile"] = r.new_tile
-        if s.map_id not in self._visited_maps:
-            self._visited_maps.add(s.map_id)
-            parts["new_map"] = r.new_map
-        if s.badges > self._best_badges:
-            parts["badge"] = r.badge * (s.badges - self._best_badges)
-            self._best_badges = s.badges
-        # Reward only levels above the best ever seen: depositing and
-        # re-withdrawing Pokémon must not be an exploitable loop.
-        if s.total_level > self._best_total_level:
-            parts["level"] = r.level * (s.total_level - self._best_total_level)
-            self._best_total_level = s.total_level
-        return sum(parts.values()), parts
 
     def _update_milestones(self, s: ProgressSignals) -> None:
         for i, milestone in enumerate(self.adapter.milestones):
@@ -186,9 +156,14 @@ class PokemonEnv(gym.Env):
             "badges": s.badges,
             "party_levels": s.party_levels,
             "in_battle": s.in_battle,
-            "tiles_visited": len(self._visited_tiles),
-            "maps_visited": len(self._visited_maps),
+            "tiles_visited": len(self._tracker.visited_tiles),
+            "maps_visited": len(self._tracker.visited_maps),
+            "items_seen": len(self._tracker.items_seen),
+            "pokedex_owned": s.pokedex_owned,
+            "pokedex_seen": s.pokedex_seen,
             "reward_parts": parts,
+            # Episode return of each reward component, to audit which one drives learning.
+            "reward_totals": dict(self._tracker.totals),
             "steps": self._steps,
             "milestone_step": self._milestone_step.copy(),
         }

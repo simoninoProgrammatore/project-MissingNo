@@ -47,9 +47,14 @@ uv run tensorboard --logdir runs
 # 3. Watch the trained agent play
 uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt
 
+# ...or save an episode as a GIF, without a window
+uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt --no-window --steps 3000 --gif best.gif
+
 # 4. A real run: overnight, one seed per night
 uv run python training/ppo.py --total-steps 100_000_000 --seed 1 --run-name ppo_s1
 ```
+
+**Reward versions** (design in `docs/rewards.md`): `--reward-version v2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline. When resuming a run, use the same version it was trained with (the script warns you if not).
 
 Every hyperparameter is a command-line option (`--num-envs`, `--learning-rate`, `--ent-coef`, ...): see `training/ppo.py` or run it with `--help`. Each run saves its configuration, TensorBoard logs and checkpoints in `runs/<run-name>/` (ignored by Git).
 
@@ -58,6 +63,8 @@ What to look at in TensorBoard:
 - `milestones/M*_rate`: fraction of recent episodes reaching each milestone. **This is the main result.**
 - `episode/tiles_visited`, `episode/maps_visited`: is the agent exploring more over time?
 - `episode/return`: total reward per episode.
+- `reward/*`: the return of each reward component. If one dominates, watch the agent before trusting the curves: that is how reward hacking is caught.
+- `episode/stagnated`: fraction of episodes ended early for lack of progress (v2).
 - `losses/entropy`: how random the policy still is. If it collapses early, the agent stops exploring.
 - `charts/SPS`: steps per second.
 

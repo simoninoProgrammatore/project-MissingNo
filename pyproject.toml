@@ -9,6 +9,7 @@ dependencies = [
     "missingno-games",
     "missingno-envs",
     "missingno-agents",
+    "pillow>=10",  # GIFs of the agent playing (scripts/watch.py)
 ]
 
 [dependency-groups]
@@ -28,6 +29,7 @@ missingno-envs = { workspace = true }
 missingno-agents = { workspace = true }
 
 [tool.ruff]
+extend-exclude = ["notebooks"]
 line-length = 100
 target-version = "py311"
 

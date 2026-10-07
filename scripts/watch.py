@@ -7,12 +7,13 @@ Usage:
     uv run python scripts/watch.py --steps 2000                                  # random agent
     uv run python scripts/watch.py --checkpoint runs/ppo_s1/checkpoints/latest.pt
     uv run python scripts/watch.py --checkpoint ... --greedy --speed 0           # best action, max speed
+    uv run python scripts/watch.py --checkpoint ... --no-window --gif best.gif   # save the episode as a GIF
 """
 
 import argparse
 from pathlib import Path
 
-from missingno_envs import ACTIONS, EnvConfig, PokemonEnv
+from missingno_envs import ACTIONS, COMPONENTS, EnvConfig, PokemonEnv, RewardConfig
 from missingno_games import ADAPTERS
 
 
@@ -34,7 +35,12 @@ def load_policy(checkpoint: str, greedy: bool):
 
 
 def main(args) -> None:
-    config = EnvConfig(rom_path=args.rom, start_state_path=args.state, max_steps=args.steps)
+    config = EnvConfig(
+        rom_path=args.rom,
+        start_state_path=args.state,
+        max_steps=args.steps,
+        rewards=RewardConfig.preset(args.reward_version),
+    )
     env = PokemonEnv(
         config,
         ADAPTERS[args.game](),
@@ -45,11 +51,14 @@ def main(args) -> None:
     milestones = env.adapter.milestones
 
     obs, info = env.reset(seed=0)
+    frames = []  # for --gif: one frame every --gif-every steps
     total = 0.0
     reached = set()
     for step in range(1, args.steps + 1):
         action = policy(obs) if policy else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
+        if args.gif and step % args.gif_every == 0:
+            frames.append(env.pyboy.screen.ndarray[:, :, :3].copy())
         total += reward
         if args.verbose and info["reward_parts"]:
             print(f"step {step:5d}  {ACTIONS[action]:>5}  +{reward:.2f}  {info['reward_parts']}")
@@ -68,7 +77,26 @@ def main(args) -> None:
         f"Episode return: {total:.2f}  tiles: {info['tiles_visited']}  maps: {info['maps_visited']}"
     )
     print(f"Milestones reached: {len(reached)}/{len(milestones)}")
+    totals = ", ".join(f"{k} {v:.2f}" for k, v in info["reward_totals"].items() if v)
+    print(f"Reward by component: {totals or 'none'}")
+    if info.get("stagnated"):
+        print("Episode ended early: no progress for too long (stagnation).")
     env.close()
+    if args.gif:
+        save_gif(frames, args.gif, args.gif_every)
+
+
+def save_gif(frames, path: str, every: int) -> None:
+    from PIL import Image
+
+    if not frames:
+        print("No frames to save.")
+        return
+    images = [Image.fromarray(f).resize((320, 288), Image.NEAREST) for f in frames]
+    # 24 frames per step at 60 fps -> one agent step = 0.4 s of game time; play it 4x faster.
+    duration_ms = max(20, int(every * 400 / 4))
+    images[0].save(path, save_all=True, append_images=images[1:], duration=duration_ms, loop=0)
+    print(f"Saved {len(images)} frames to {path}")
 
 
 if __name__ == "__main__":
@@ -84,6 +112,9 @@ if __name__ == "__main__":
     parser.add_argument("--greedy", action="store_true", help="always pick the most likely button")
     parser.add_argument("--verbose", action="store_true", help="print every reward")
     parser.add_argument("--no-window", action="store_true", help="run without a window")
+    parser.add_argument("--reward-version", default="v2", choices=sorted(COMPONENTS))
+    parser.add_argument("--gif", help="save the episode as a GIF at this path")
+    parser.add_argument("--gif-every", type=int, default=2, help="keep one frame every N steps")
     args = parser.parse_args()
     if args.checkpoint and not Path(args.checkpoint).exists():
         available = sorted(str(p) for p in Path("runs").glob("*/checkpoints/*.pt"))

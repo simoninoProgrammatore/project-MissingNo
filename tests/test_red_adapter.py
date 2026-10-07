@@ -47,3 +47,32 @@ def test_phase1_milestones():
     assert reached(map_id=R.REDS_HOUSE_1F, x=0, y=0) == ["M1"]
     assert reached(map_id=R.OAKS_LAB, x=0, y=0, party_levels=(5,)) == ["M3", "M4"]
     assert reached(map_id=R.VIRIDIAN_CITY, x=0, y=0, party_levels=(6,)) == ["M4", "M6"]
+
+
+def test_reads_bag_pokedex_and_map_size():
+    mem = FakeMemory()
+    mem[R.MAP_HEIGHT], mem[R.MAP_WIDTH] = 9, 10
+    mem[R.NUM_BAG_ITEMS] = 2
+    mem[R.BAG_ITEMS], mem[R.BAG_ITEMS + 1] = 0x14, 3  # Potion x3
+    mem[R.BAG_ITEMS + 2], mem[R.BAG_ITEMS + 3] = 0x46, 1  # Oak's Parcel
+    mem[R.POKEDEX_OWNED] = 0b00000001
+    mem[R.POKEDEX_SEEN] = 0b00000111
+    mem[R.POKEDEX_SEEN + 18] = 0b00000001
+
+    s = RedAdapter().read(mem)
+    assert s.map_area == 4 * 9 * 10
+    assert s.items == {0x14, 0x46}
+    assert s.key_items == {0x46}
+    assert s.pokedex_owned == 1
+    assert s.pokedex_seen == 4
+
+
+def test_bag_count_is_clamped():
+    mem = FakeMemory()
+    mem[R.NUM_BAG_ITEMS] = 0xFF  # garbage during the intro
+    assert len(RedAdapter().read(mem).items) <= 1  # 20 reads of zeros -> {0}
+
+
+def test_hms_are_key_items():
+    assert all(hm in R.KEY_ITEMS for hm in range(0xC4, 0xC9))
+    assert 0x14 not in R.KEY_ITEMS  # Potion

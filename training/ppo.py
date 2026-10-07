@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from gymnasium.vector import AutoresetMode
 from missingno_agents import CnnActorCritic
-from missingno_envs import EnvConfig, PokemonEnv
+from missingno_envs import COMPONENTS, EnvConfig, PokemonEnv, RewardConfig
 from missingno_games import ADAPTERS
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
@@ -49,6 +49,7 @@ class Config:
     state: str = "states/red_start.state"
     total_steps: int = 100_000_000  # agent steps, summed over all parallel games
     episode_steps: int = 8192  # length of one episode (~15 minutes of game time)
+    reward_version: str = "v2"  # see docs/rewards.md; "v1" = the original Phase 1 baseline
     # --- parallelism
     num_envs: int = 6  # parallel games: leave a core or two free for the OS
     num_steps: int = 256  # steps per game before each learning phase
@@ -78,12 +79,21 @@ class Config:
 def make_env(cfg: Config, index: int) -> gym.Env:
     """Build one game. Defined at top level so subprocesses can create it."""
     state = cfg.state if Path(cfg.state).exists() else None
-    env_cfg = EnvConfig(rom_path=cfg.rom, start_state_path=state, max_steps=cfg.episode_steps)
+    env_cfg = EnvConfig(
+        rom_path=cfg.rom,
+        start_state_path=state,
+        max_steps=cfg.episode_steps,
+        rewards=RewardConfig.preset(cfg.reward_version),
+    )
     return PokemonEnv(env_cfg, ADAPTERS[cfg.game]())
 
 
 def train(cfg: Config) -> None:
     # ------------------------------------------------------------------ setup
+    if cfg.reward_version not in COMPONENTS:
+        raise SystemExit(
+            f"Unknown --reward-version {cfg.reward_version!r}: choose from {sorted(COMPONENTS)}"
+        )
     run_dir = Path("runs") / cfg.run_name
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (run_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
@@ -145,6 +155,13 @@ def train(cfg: Config) -> None:
         first_update = saved.get("update", 0) + 1
         best_reached = saved.get("best_reached", 0)
         print(f"Resumed from {cfg.resume}: step {global_step:,}, update {first_update - 1}")
+        # Checkpoints saved before reward versions existed were trained with v1.
+        saved_version = saved.get("config", {}).get("reward_version", "v1")
+        if saved_version != cfg.reward_version:
+            print(
+                f"WARNING: this run was trained with reward {saved_version}, now continuing with "
+                f"{cfg.reward_version}. Add --reward-version {saved_version} to keep it consistent."
+            )
     # purge_step drops any log entries written after the checkpoint by an interrupted session.
     writer = SummaryWriter(str(run_dir), purge_step=global_step if cfg.resume else None)
 
@@ -153,7 +170,7 @@ def train(cfg: Config) -> None:
 
     print(
         f"Run '{cfg.run_name}': {cfg.num_envs} games, {num_updates} updates of {batch_size} steps, "
-        f"device {device}, {cfg.torch_threads} torch threads, "
+        f"device {device}, {cfg.torch_threads} torch threads, reward {cfg.reward_version}, "
         f"{sum(p.numel() for p in agent.parameters()):,} parameters"
     )
 
@@ -303,6 +320,15 @@ def _log_episode(writer, step, info, i, milestones, recent, best_reached) -> int
     writer.add_scalar("episode/length", info["episode"]["l"][i], step)
     writer.add_scalar("episode/tiles_visited", final["tiles_visited"][i], step)
     writer.add_scalar("episode/maps_visited", final["maps_visited"][i], step)
+    for key in ("items_seen", "pokedex_owned", "pokedex_seen", "stagnated"):
+        if key in final:
+            writer.add_scalar(f"episode/{key}", float(final[key][i]), step)
+    # Return of each reward component: if one dominates, watch the agent before
+    # trusting the curves. That is how reward hacking is caught.
+    totals = final.get("reward_totals", {})
+    for name in totals:
+        if not name.startswith("_"):
+            writer.add_scalar(f"reward/{name}", float(totals[name][i]), step)
 
     reached_at = np.asarray(final["milestone_step"][i])
     recent.append(reached_at >= 0)

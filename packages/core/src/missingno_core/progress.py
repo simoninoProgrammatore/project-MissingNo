@@ -19,6 +19,14 @@ class ProgressSignals:
     badges: int = 0
     party_levels: tuple[int, ...] = field(default_factory=tuple)
     in_battle: bool = False
+    #: Walkable area of the current map, in player steps (width x height).
+    map_area: int = 0
+    #: IDs of the items currently in the bag.
+    items: frozenset[int] = frozenset()
+    #: Subset of `items` the game itself marks as key items (cannot be bought or sold).
+    key_items: frozenset[int] = frozenset()
+    pokedex_owned: int = 0
+    pokedex_seen: int = 0
 
     @property
     def cell(self) -> tuple[int, int, int]:

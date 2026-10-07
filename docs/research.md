@@ -56,7 +56,7 @@ Written before the experiments. A rejected hypothesis is a result, not a failure
 1. **Pixels only.** The agent observes only the screen. Memory contents are never part of its input.
 2. **Tabula rasa.** No human demonstrations, no pre-trained models, no language models. Everything is learned from interaction.
 3. **"The manual yes, the guide no."** Allowed: anything a player would find in the game's instruction booklet (general mechanics). Not allowed: walkthrough knowledge specific to a game (which tree to cut, where to go next).
-4. **Generic rewards.** The same reward function for every game, computed from game-agnostic progress signals: first visit to a tile, first visit to a map, new badges, new party levels above the best seen.
+4. **Generic rewards.** The same reward function for every game, computed from game-agnostic progress signals: first visit to a tile, first visit to a map, new badges, new party levels above the best seen. The full design, with edge cases and the planned versions, is in [`rewards.md`](rewards.md).
 5. **Adapters for rewards and evaluation only.** One small adapter per game reads its memory to compute rewards and milestones. This privileged information is used *by the training and evaluation code*, never by the agent.
 6. **Game-specific milestones are for measuring, not for rewarding.** Milestones (e.g. "reached Viridian City") are defined per game to evaluate progress; they never enter the reward.
 7. **Pre-registration.** Hypotheses, held-out games, budgets and cost gates are written in this document before running the corresponding experiments.
