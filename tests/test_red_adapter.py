@@ -47,6 +47,15 @@ def test_phase1_milestones():
     assert reached(map_id=R.REDS_HOUSE_1F, x=0, y=0) == ["M1"]
     assert reached(map_id=R.OAKS_LAB, x=0, y=0, party_levels=(5,)) == ["M3", "M4"]
     assert reached(map_id=R.VIRIDIAN_CITY, x=0, y=0, party_levels=(6,)) == ["M4", "M6"]
+    assert reached(
+        map_id=R.PEWTER_GYM,
+        x=0,
+        y=0,
+        party_levels=(12,),
+        badges=1,
+        items=frozenset({R.OAKS_PARCEL}),
+    ) == ["M4", "M7", "M11", "M12"]
+    assert R.MILESTONES[-1].name == "Win the Boulder Badge"  # the final goal
 
 
 def test_reads_bag_pokedex_and_map_size():
@@ -76,3 +85,12 @@ def test_bag_count_is_clamped():
 def test_hms_are_key_items():
     assert all(hm in R.KEY_ITEMS for hm in range(0xC4, 0xC9))
     assert 0x14 not in R.KEY_ITEMS  # Potion
+
+
+def test_reads_party_experience():
+    mem = FakeMemory()
+    mem[R.PARTY_COUNT] = 2
+    mem[R.PARTY_EXP], mem[R.PARTY_EXP + 1], mem[R.PARTY_EXP + 2] = 0x00, 0x01, 0x2C  # 300
+    second = R.PARTY_EXP + R.PARTY_MON_SIZE
+    mem[second], mem[second + 1], mem[second + 2] = 0x01, 0x00, 0x00  # 65536
+    assert RedAdapter().read(mem).party_exp == (300, 65536)

@@ -10,6 +10,8 @@ dependencies = [
     "missingno-envs",
     "missingno-agents",
     "pillow>=10",  # GIFs of the agent playing (scripts/watch.py)
+    "imageio>=2.30",  # videos of replays (scripts/replay.py)
+    "imageio-ffmpeg>=0.5",
 ]
 
 [dependency-groups]

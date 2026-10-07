@@ -1,6 +1,6 @@
 # Project MissingNo — Reward design (RL only)
 
-> **Status:** v1, v2 and v2.1 are implemented (`packages/envs/src/missingno_envs/rewards.py`, selected with `--reward-version`; v2 is the default). v3 and v4 are design proposals. Components are added one at a time and ablated (Section 9). Weights are tuned **only on training games** and frozen before any held-out evaluation.
+> **Status:** v1, v2, v2.1 and v2.2 are implemented (`packages/envs/src/missingno_envs/rewards.py`, selected with `--reward-version`; v2 is the default). v3 and v4 are design proposals. Components are added one at a time and ablated (Section 9). Weights are tuned **only on training games** and frozen before any held-out evaluation.
 
 The reward is the only thing that tells a tabula rasa agent what "playing well" means. It must push toward progress in *every* Generation 1–3 game without ever saying *what* to do or *where* to go.
 
@@ -176,6 +176,12 @@ v2.1 keeps the episodic rule (a tile pays at most once per episode, so nothing c
 
 Counts are built only from the agent's own experience and never reset during training. With parallel games, each game keeps its own counts (an approximation; they can be shared later). This is count-based exploration, a general principle, not knowledge of the game.
 
+### 5.2 v2.2: experience instead of levels
+
+Observed in the v2 and v2.1 runs: the agent learned to **always flee** from wild battles. A battle takes about a hundred steps and pays nothing until a level goes up, which takes two or three battles; in the same hundred steps, walking on new tiles pays right away. From the agent's point of view, fleeing is the rational choice. It stops being rational at the first unavoidable trainer, and at Brock.
+
+v2.2 replaces the level-based team strength with an experience potential, `log(1 + total experience of the 4 most experienced Pokémon / 100)`, paid when it beats its best value. Experience grows after **every** battle won, so every win pays immediately. Calibration: an early wild battle (+40 exp at level 5) is worth about 0.3, i.e. ~15 common tiles or ~3 never-seen ones; the first Pokémon is worth about as much as in v2. The logarithm makes the same battle worth much less for a strong team, so grinding fades out, and max-so-far makes depositing and re-withdrawing Pokémon worthless. Experience exists in every game, so the rule is generic.
+
 ## 6. Stagnation: truncation, not penalty
 
 If an episode produces **no extrinsic progress and no new tile for K steps** (start: K = 2,000), it is truncated. Effects:
@@ -217,6 +223,7 @@ If an invariant breaks, the episode ends **with no reward for that step**, and t
 | v1 ✅ | tiles, maps, badges, levels (linear, max-so-far) | Phase 1 baseline |
 | v2 ✅ (default) | area-scaled maps, concave top-4 levels, new items (key items worth more), Pokédex, stagnation truncation | Phase 1 |
 | v2.1 ✅ | v2 + lifelong rarity of tiles (episodic first visit × 1/√(episodes that visited it)) + directed passages between maps, same decay | Phase 1 (after the lab bottleneck) |
+| v2.2 ✅ | v2.1 with **experience** instead of levels: `experience × log(1 + exp_top4 / 100)`, max-so-far | Phase 1 → first badge |
 | v3 | dialogue novelty, HP/PP potentials, blackout, first trainer wins, corruption guard | Phase 1–2 |
 | v4 | two value heads, episodic + lifelong (RND) novelty | Phase 2 |
 | Declared extras | event-flag count; HM-specific reward | separate experiments, reported apart |

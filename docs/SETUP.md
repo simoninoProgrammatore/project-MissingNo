@@ -57,7 +57,7 @@ uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt --n
 uv run python training/ppo.py --total-steps 100_000_000 --seed 1 --run-name ppo_s1
 ```
 
-**Reward versions** (design in `docs/rewards.md`): `--reward-version v2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline; `--reward-version v2.1` adds exploration that wears out with use.
+**Reward versions** (design in `docs/rewards.md`): `--reward-version v2` is the default; `--reward-version v1` reproduces the original Phase 1 baseline; `--reward-version v2.1` adds exploration that wears out with use; `--reward-version v2.2` also rewards experience instead of levels, so that every battle won pays (with v2 and v2.1 the agent learned to always flee).
 
 To try a new reward **starting from an already trained model**, resume it into a new run, so the original stays untouched:
 
@@ -72,6 +72,16 @@ uv run python training/ppo.py ... --reward-version v2.1 --run-name v21_from_v2 -
 **Backward curriculum** (`--curriculum-prob 0.3`): when an episode reaches a map that no episode ever reached before, its path (one saved state every 64 steps) becomes a *demo*. Some episodes then start just before that success; when the agent reaches the goal in at least 4 of the last 8 tries, the start moves one step back, until the whole path is learned. The demos are the agent's own successes: no human data. Logged under `curriculum/*`, excluded from the milestone curves.
 
 **Self-imitation learning** (`--sil-coef 1.0`): the 5% of actions of each batch that turned out much better than expected are kept in a buffer (~170 MB of RAM for 10,000), and replayed at every learning phase, but only while they are still better than what the agent now expects. A rare success is practiced instead of forgotten. Logged under `sil/*`.
+
+**Final goal and replay** (`--stop-at-goal`): training stops as soon as an episode **from the start state** reaches the last milestone (for Red: the Boulder Badge). Its replay, the start state plus every button pressed, is saved in `runs/<run-name>/replays/`, and the model in `checkpoints/winner.pt`. The emulator is deterministic, so the replay reproduces the exact game:
+
+```bash
+uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz                  # window, normal speed
+uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz --speed 4        # window, 4x
+uv run python scripts/replay.py runs/<run>/replays/goal_env0_ep12.npz --video badge.mp4 --video-speed 4
+```
+
+Replays contain the start state, i.e. game data: keep them private, like ROMs.
 
 **Stagnation** (`--stagnation-steps`): end an episode after this many steps without progress; `0` = never, `-1` = the reward version's default.
 

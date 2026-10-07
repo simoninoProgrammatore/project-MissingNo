@@ -22,6 +22,8 @@ PLAYER_X = 0xD362
 BADGES = 0xD356  # bitfield, one bit per badge
 PARTY_COUNT = 0xD163
 PARTY_LEVELS = (0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268)
+PARTY_MON_SIZE = 0x2C
+PARTY_EXP = 0xD179  # 3 bytes, big-endian, first party Pokémon; +0x2C for the next
 IS_IN_BATTLE = 0xD057  # 0 = no battle, 1 = wild, 2 = trainer, 0xFF = just lost
 MAP_HEIGHT = 0xD368  # in blocks; one block = 2x2 player steps
 MAP_WIDTH = 0xD369
@@ -72,15 +74,22 @@ KEY_ITEMS: frozenset[int] = frozenset(
     )
 ) | frozenset(range(0xC4, 0xC9))
 
-# Map IDs (pret/pokered constants). 37 and 38 verified in our first run.
+# Map IDs (pret/pokered constants/map_constants.asm, verified).
 PALLET_TOWN = 0
 VIRIDIAN_CITY = 1
+PEWTER_CITY = 2
 ROUTE_1 = 12
+ROUTE_2 = 13
 REDS_HOUSE_1F = 37
 REDS_HOUSE_2F = 38
 OAKS_LAB = 40
+VIRIDIAN_MART = 42
+VIRIDIAN_FOREST = 51
+PEWTER_GYM = 54
+OAKS_PARCEL = 0x46
 
-# Phase 1 milestones: from the bedroom to Viridian City (docs/research.md, 6.1).
+# Milestones: from the bedroom to the first badge. Used ONLY to measure progress,
+# never as rewards. The last one is the final goal of the current phase.
 MILESTONES: tuple[Milestone, ...] = (
     Milestone("M1", "Leave the bedroom", lambda s: s.map_id == REDS_HOUSE_1F),
     Milestone("M2", "Leave the house", lambda s: s.map_id == PALLET_TOWN),
@@ -88,6 +97,13 @@ MILESTONES: tuple[Milestone, ...] = (
     Milestone("M4", "Obtain the first Pokémon", lambda s: len(s.party_levels) > 0),
     Milestone("M5", "Reach Route 1", lambda s: s.map_id == ROUTE_1),
     Milestone("M6", "Reach Viridian City", lambda s: s.map_id == VIRIDIAN_CITY),
+    Milestone("M7", "Get Oak's Parcel", lambda s: OAKS_PARCEL in s.items),
+    # The old man blocks the way north until the parcel has been delivered to Oak.
+    Milestone("M8", "Reach Route 2", lambda s: s.map_id == ROUTE_2),
+    Milestone("M9", "Enter Viridian Forest", lambda s: s.map_id == VIRIDIAN_FOREST),
+    Milestone("M10", "Reach Pewter City", lambda s: s.map_id == PEWTER_CITY),
+    Milestone("M11", "Enter Pewter Gym", lambda s: s.map_id == PEWTER_GYM),
+    Milestone("M12", "Win the Boulder Badge", lambda s: s.badges >= 1),
 )
 
 
@@ -113,7 +129,13 @@ class RedAdapter:
             key_items=items & KEY_ITEMS,
             pokedex_owned=_count_bits(memory, POKEDEX_OWNED, POKEDEX_BYTES),
             pokedex_seen=_count_bits(memory, POKEDEX_SEEN, POKEDEX_BYTES),
+            party_exp=tuple(_read_exp(memory, i) for i in range(party_count)),
         )
+
+
+def _read_exp(memory: Memory, slot: int) -> int:
+    a = PARTY_EXP + slot * PARTY_MON_SIZE
+    return (memory[a] << 16) | (memory[a + 1] << 8) | memory[a + 2]
 
 
 def _count_bits(memory: Memory, start: int, n_bytes: int) -> int:

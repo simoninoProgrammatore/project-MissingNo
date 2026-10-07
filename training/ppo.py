@@ -78,6 +78,11 @@ class Config:
     record_every: int = 0  # keep one frame every N steps of each episode; 0 = off. Try 4
     gif_every_steps: int = 10_000  # save the best episode of each window of this many steps
     gif_keep: int = 20  # periodic GIFs kept; record-breaking GIFs are always kept
+    # --- final goal
+    # Stop training as soon as an episode from the start state reaches the last
+    # milestone (for Red: the Boulder Badge). Its replay is saved in
+    # runs/<name>/replays, the model in checkpoints/winner.pt.
+    stop_at_goal: bool = False
     # --- parallelism
     num_envs: int = 6  # parallel games: leave a core or two free for the OS
     num_steps: int = 256  # steps per game before each learning phase
@@ -125,6 +130,8 @@ def make_env(cfg: Config, index: int) -> gym.Env:
         record_every=cfg.record_every,
         record_dir=str(Path("runs") / cfg.run_name / "recordings"),
         record_tag=f"env{index}",
+        stop_at_goal=cfg.stop_at_goal,
+        replay_dir=str(Path("runs") / cfg.run_name / "replays"),
     )
     if cfg.show and index == 0:
         # emulation_speed=0: the watched game must not slow down the other games,
@@ -224,7 +231,7 @@ def train(cfg: Config) -> None:
         f"Run '{cfg.run_name}': {cfg.num_envs} games, {num_updates} updates of {batch_size} steps, "
         f"device {device}, {cfg.torch_threads} torch threads, reward {cfg.reward_version}, "
         f"archive {cfg.archive_prob:.0%}, curriculum {cfg.curriculum_prob:.0%}, "
-        f"SIL {cfg.sil_coef}, "
+        f"SIL {cfg.sil_coef}, stop at goal: {cfg.stop_at_goal}, "
         f"{sum(p.numel() for p in agent.parameters()):,} parameters"
     )
 
@@ -235,6 +242,7 @@ def train(cfg: Config) -> None:
     deadline = start + cfg.time_limit_hours * 3600 if cfg.time_limit_hours > 0 else None
     completed = first_update - 1  # last fully completed update
 
+    goal = None  # (replay path, step) once an episode from the start reaches the goal
     try:
         play_time = learn_time = 0.0
         for update in range(first_update, num_updates + 1):
@@ -264,8 +272,11 @@ def train(cfg: Config) -> None:
 
                 if "final_info" in info:
                     for i in np.flatnonzero(info["_final_info"]):
+                        final = info["final_info"]
+                        if "goal_reached" in final and final["goal_reached"][i]:
+                            goal = (str(final["replay"][i]), global_step)
                         if highlights is not None:
-                            _add_highlight(highlights, info["final_info"], i, global_step)
+                            _add_highlight(highlights, final, i, global_step)
                         best_reached = _log_episode(
                             writer,
                             global_step,
@@ -276,7 +287,19 @@ def train(cfg: Config) -> None:
                             best_reached,
                         )
 
+                if goal is not None:
+                    break  # the final goal is reached: no need to finish this rollout
+
             play_time += time.time() - t_play
+            if goal is not None:
+                replay, step = goal
+                save(run_dir / "checkpoints" / "winner.pt", update)
+                save(run_dir / "checkpoints" / "latest.pt", update)
+                print(f"\n*** FINAL GOAL REACHED at step {step:,}: {milestones[-1].name}! ***")
+                print(f"    replay: {replay}")
+                print(f"    model:  {run_dir / 'checkpoints' / 'winner.pt'}")
+                print(f"    watch it: uv run python scripts/replay.py {replay}")
+                break
             if highlights is not None:
                 highlights.maybe_flush(global_step)
             t_learn = time.time()

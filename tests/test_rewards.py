@@ -210,3 +210,54 @@ def test_v2_is_unchanged_by_v21():
     parts = episodes(tracker, 10, [S(map_id=0), S(map_id=1, map_area=400, x=1)])[0]
     assert parts["new_tile"] == pytest.approx(C.new_tile)
     assert "passage" not in parts
+
+
+# --- v2.2: experience instead of levels --------------------------------------------
+
+C22 = RewardConfig.preset("v2.2")
+
+
+def test_every_battle_won_is_rewarded_even_without_a_level_up():
+    # Starter at level 5 (~135 exp), one wild battle won: +40 exp, same level.
+    _, parts = run(
+        [S(party_levels=(5,), party_exp=(135,)), S(party_levels=(5,), party_exp=(175,))], C22
+    )
+    assert parts[0]["experience"] > 0
+    assert "team" not in parts[0]
+
+
+def test_an_early_battle_is_worth_about_ten_new_tiles():
+    _, parts = run([S(party_exp=(135,)), S(party_exp=(175,))], C22)
+    assert 5 * C22.new_tile < parts[0]["experience"] < 20 * C22.rare_tile
+
+
+def test_first_pokemon_is_rewarded_like_in_v2():
+    _, v22 = run([S(), S(party_levels=(5,), party_exp=(135,))], C22)
+    _, v2 = run([S(), S(party_levels=(5,))], C)
+    assert v22[0]["experience"] == pytest.approx(v2[0]["team"], rel=0.25)
+
+
+def test_grinding_pays_less_and_less():
+    _, early = run([S(party_exp=(135,)), S(party_exp=(175,))], C22)
+    _, late = run([S(party_exp=(30_000,)), S(party_exp=(30_800,))], C22)  # a strong team
+    assert early[0]["experience"] > 5 * late[0]["experience"]
+
+
+def test_deposit_and_withdraw_does_not_pay_experience():
+    team = (3000, 2000)
+    states = [
+        S(party_exp=team),
+        S(party_exp=(3000,)),
+        S(party_exp=team),
+        S(party_exp=(3000,)),
+        S(party_exp=team),
+    ]
+    tracker, _ = run(states, C22)
+    assert tracker.totals["experience"] == 0
+
+
+def test_v22_keeps_rarity_and_passages():
+    assert "passage" in RewardTracker(C22).components
+    tracker = RewardTracker(C22)
+    tracker.reset(S())
+    assert tracker.step(S(x=1), 1)[1]["new_tile"] == pytest.approx(C22.rare_tile)

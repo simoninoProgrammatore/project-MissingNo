@@ -19,6 +19,12 @@ Versions:
        crossed in each direction, with the same decay.
        The counts are kept for the whole training and built only from the
        agent's own experience: no map, no knowledge of the game.
+- v2.2: v2.1 with experience instead of levels. Levels go up only every few
+       battles, so a single battle paid nothing until the level changed, and
+       the agent learned to always flee (walking on new tiles paid more and
+       sooner). Experience points grow after every battle won, so every win is
+       rewarded right away. Still concave and max-so-far: grinding forever, or
+       depositing and re-withdrawing Pokémon, does not pay.
 """
 
 from __future__ import annotations
@@ -41,7 +47,20 @@ COMPONENTS: dict[str, tuple[str, ...]] = {
         "dex_owned",
         "dex_seen",
     ),
+    "v2.2": (
+        "new_tile",
+        "new_map",
+        "passage",
+        "badge",
+        "experience",
+        "new_item",
+        "dex_owned",
+        "dex_seen",
+    ),
 }
+
+# Versions that use the lifelong rarity of tiles and the passages (v2.1 and later).
+_RARITY_VERSIONS = ("v2.1", "v2.2")
 
 
 @dataclass(frozen=True)
@@ -68,13 +87,19 @@ class RewardConfig:
     # v2.1 only: rewards that decay with how many past episodes already had them
     rare_tile: float = 0.1  # a never-visited tile; after n episodes it is worth rare_tile/sqrt(n)
     passage: float = 0.2  # a never-crossed passage between maps, in one direction
+    # v2.2 only: experience. Potential = log(1 + total_exp / exp_scale) over the
+    # `team_size` Pokémon with the most experience; paid when it beats its best.
+    # Calibrated so that an early battle won is worth about ten new tiles, and the
+    # first Pokémon about as much as the v2 "team" reward.
+    experience: float = 2.0
+    exp_scale: float = 100.0
 
     @classmethod
     def preset(cls, version: str) -> RewardConfig:
         if version == "v1":
             # Exactly the Phase 1 baseline.
             return cls(version="v1", badge=5.0, stagnation_steps=0)
-        if version in ("v2", "v2.1"):
+        if version in ("v2", "v2.1", "v2.2"):
             return cls(version=version)
         raise ValueError(f"Unknown reward version {version!r}: choose from {sorted(COMPONENTS)}")
 
@@ -91,6 +116,17 @@ def team_strength(levels: tuple[int, ...], size: int) -> float:
     """
     best = sorted(levels, reverse=True)[:size]
     return sum(math.log(level) for level in best if level > 0)
+
+
+def experience_potential(party_exp: tuple[int, ...], size: int, scale: float) -> float:
+    """log(1 + total experience of the `size` most experienced Pokémon / scale).
+
+    Grows after every battle won, with diminishing returns: the same battle is
+    worth a lot for a young team and little for a strong one. A weak new catch
+    only counts if it becomes one of the most experienced.
+    """
+    best = sorted(party_exp, reverse=True)[:size]
+    return math.log1p(sum(best) / scale)
 
 
 class RewardTracker:
@@ -116,6 +152,7 @@ class RewardTracker:
         self.best_badges = s.badges
         self.best_total_level = s.total_level
         self.best_team = team_strength(s.party_levels, c.team_size)
+        self.best_exp = experience_potential(s.party_exp, c.team_size, c.exp_scale)
         self.items_seen = set(s.items)  # items already held at the start do not pay
         self.best_owned = s.pokedex_owned
         self.best_seen = s.pokedex_seen
@@ -128,13 +165,13 @@ class RewardTracker:
 
         if s.cell not in self.visited_tiles:
             self.visited_tiles.add(s.cell)
-            if c.version == "v2.1":
+            if c.version in _RARITY_VERSIONS:
                 n = self._count(self.tile_episodes, s.cell)
                 parts["new_tile"] = c.rare_tile / math.sqrt(n)
             else:
                 parts["new_tile"] = c.new_tile
 
-        if c.version == "v2.1" and s.map_id != self.previous_map:
+        if c.version in _RARITY_VERSIONS and s.map_id != self.previous_map:
             passage = (self.previous_map, s.map_id)  # directed: in and out are different
             if passage not in self.crossed_passages:
                 self.crossed_passages.add(passage)
@@ -159,12 +196,18 @@ class RewardTracker:
             if s.total_level > self.best_total_level:
                 parts["level"] = c.level * (s.total_level - self.best_total_level)
                 self.best_total_level = s.total_level
+        elif c.version == "v2.2":
+            exp = experience_potential(s.party_exp, c.team_size, c.exp_scale)
+            if exp > self.best_exp + 1e-9:
+                parts["experience"] = c.experience * (exp - self.best_exp)
+                self.best_exp = exp
         else:
             team = team_strength(s.party_levels, c.team_size)
             if team > self.best_team + 1e-9:
                 parts["team"] = c.team * (team - self.best_team)
                 self.best_team = team
 
+        if c.version != "v1":
             new_items = s.items - self.items_seen
             if new_items:
                 self.items_seen |= new_items

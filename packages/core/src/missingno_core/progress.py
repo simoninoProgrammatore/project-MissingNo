@@ -27,6 +27,8 @@ class ProgressSignals:
     key_items: frozenset[int] = frozenset()
     pokedex_owned: int = 0
     pokedex_seen: int = 0
+    #: Total experience points of each party Pokémon (grows after every battle won).
+    party_exp: tuple[int, ...] = field(default_factory=tuple)
 
     @property
     def cell(self) -> tuple[int, int, int]:

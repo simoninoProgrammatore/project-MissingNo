@@ -3,7 +3,13 @@
 from missingno_envs.archive import StateArchive, cell_key
 from missingno_envs.curriculum import BackwardCurriculum, Demo
 from missingno_envs.pokemon import ACTIONS, EnvConfig, PokemonEnv
-from missingno_envs.rewards import COMPONENTS, RewardConfig, RewardTracker, team_strength
+from missingno_envs.rewards import (
+    COMPONENTS,
+    RewardConfig,
+    RewardTracker,
+    experience_potential,
+    team_strength,
+)
 
 __all__ = [
     "ACTIONS",
@@ -16,5 +22,6 @@ __all__ = [
     "RewardTracker",
     "StateArchive",
     "cell_key",
+    "experience_potential",
     "team_strength",
 ]

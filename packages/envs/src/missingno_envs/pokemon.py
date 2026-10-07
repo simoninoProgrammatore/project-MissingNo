@@ -59,6 +59,12 @@ class EnvConfig:
     record_every: int = 0
     record_dir: str | None = None
     record_tag: str = "env"
+    # Final goal: when an episode from the start state reaches the adapter's last
+    # milestone (e.g. the first badge), the episode ends and its replay is saved:
+    # start state + every button pressed. The emulator is deterministic, so the
+    # replay reproduces the exact game (scripts/replay.py), at any speed.
+    stop_at_goal: bool = False
+    replay_dir: str | None = None
 
 
 class PokemonEnv(gym.Env):
@@ -94,6 +100,9 @@ class PokemonEnv(gym.Env):
         self._recording: list[np.ndarray] | None = None
         self._episode_index = 0
         self._last_recording = ""
+        self._actions: list[int] | None = None
+        self._goal_reached = False
+        self._last_replay = ""
         self.render_mode = render_mode
 
         _check_rom(config.rom_path, adapter)
@@ -149,6 +158,9 @@ class PokemonEnv(gym.Env):
         self._recording = [] if cfg.record_every > 0 and cfg.record_dir and from_start else None
         self._last_recording = ""
         self._episode_index += 1
+        self._actions: list[int] | None = [] if cfg.stop_at_goal and from_start else None
+        self._goal_reached = False
+        self._last_replay = ""
 
         signals = self.adapter.read(self.pyboy.memory)
         self._maps_ever.add(signals.map_id)
@@ -166,6 +178,8 @@ class PokemonEnv(gym.Env):
     def step(self, action: int):
         button = ACTIONS[int(action)]
         cfg = self.config
+        if self._actions is not None:
+            self._actions.append(int(action))
         self.pyboy.button(button, cfg.press_frames)
         # Render only the last frame: much faster, and it's the one we observe.
         self.pyboy.tick(cfg.frames_per_action - 1, False)
@@ -185,7 +199,10 @@ class PokemonEnv(gym.Env):
         terminated = False  # Pokémon has no "game over": only time limits
         stagnated = self._tracker.stagnant(self._steps)
         max_steps = self._demo.budget() if self._demo is not None else cfg.max_steps
-        truncated = self._steps >= max_steps or stagnated or demo_success
+        if self._actions is not None and self._milestone_step[-1] >= 0:
+            self._goal_reached = True  # final milestone, in an episode from the start
+            self._save_replay()
+        truncated = self._steps >= max_steps or stagnated or demo_success or self._goal_reached
         if truncated:
             self._end_episode(demo_success)
         info = self._info(signals, parts)
@@ -238,6 +255,24 @@ class PokemonEnv(gym.Env):
             self._last_recording = str(path)
             self._recording = None
 
+    def _save_replay(self) -> None:
+        cfg = self.config
+        folder = Path(cfg.replay_dir or ".")
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"goal_{cfg.record_tag}_ep{self._episode_index}.npz"
+        np.savez_compressed(
+            path,
+            actions=np.asarray(self._actions, dtype=np.uint8),
+            start_state=np.frombuffer(self._start_state, dtype=np.uint8),
+            frames_per_action=cfg.frames_per_action,
+            press_frames=cfg.press_frames,
+            game=self.adapter.name,
+            milestone_step=self._milestone_step,
+            milestone_names=np.array([m.name for m in self.adapter.milestones]),
+        )
+        self._last_replay = str(path)
+        self._actions = None
+
     def _save_state(self) -> bytes:
         buffer = io.BytesIO()
         self.pyboy.save_state(buffer)
@@ -282,6 +317,8 @@ class PokemonEnv(gym.Env):
             "demos_completed": self.curriculum.completed if self.curriculum is not None else 0,
             "demo_progress": self._demo.progress if self._demo is not None else 0.0,
             "recording": self._last_recording,
+            "goal_reached": self._goal_reached,
+            "replay": self._last_replay,
         }
 
 
