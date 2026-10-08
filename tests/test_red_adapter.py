@@ -55,7 +55,25 @@ def test_phase1_milestones():
         badges=1,
         items=frozenset({R.OAKS_PARCEL}),
     ) == ["M4", "M7", "M11", "M12"]
-    assert R.MILESTONES[-1].name == "Win the Boulder Badge"  # the final goal
+    assert R.MILESTONES[11].name == "Win the Boulder Badge"
+
+
+def test_milestones_go_to_the_hall_of_fame_and_the_phase_goal_is_the_first_badge():
+    from missingno_core import ProgressSignals
+    from missingno_games import RedAdapter, goal_index
+
+    ids = [m.id for m in R.MILESTONES]
+    assert ids == [f"M{i}" for i in range(1, 41)]
+    assert R.MILESTONES[goal_index(RedAdapter())].name == "Win the Boulder Badge"
+    assert R.MILESTONES[goal_index(RedAdapter(), "M40")].reached(
+        ProgressSignals(map_id=R.HALL_OF_FAME, x=0, y=0)
+    )
+    reached = lambda **kw: [m.id for m in R.MILESTONES if m.reached(ProgressSignals(**kw))]  # noqa: E731
+    hms = frozenset({R.HM_CUT, R.HM_SURF, R.HM_STRENGTH, R.S_S_TICKET})
+    assert {"M18", "M20", "M31", "M32"} <= set(reached(map_id=99, x=0, y=0, items=hms))
+    assert {"M12", "M16", "M21", "M25", "M30", "M34", "M36", "M37"} <= set(
+        reached(map_id=99, x=0, y=0, badges=8)
+    )
 
 
 def test_reads_bag_pokedex_and_map_size():

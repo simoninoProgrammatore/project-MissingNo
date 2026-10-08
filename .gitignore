@@ -25,6 +25,9 @@ roms/*
 !roms/README.md
 states/*
 !states/README.md
+# Emulator cores (downloaded with scripts/get_mgba_core.py)
+cores/*
+!cores/README.md
 
 # Local Showdown server (archived battle exercise)
 pokemon-showdown/

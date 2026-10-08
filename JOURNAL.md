@@ -170,3 +170,60 @@ From scratch, reward v2.2, 30,000-step episodes, archive 30%, curriculum 30%, se
 - Later, a **two-level memory**: the GRU plus a long-term store of a few dozen memories, written when the screen changes a lot (computed from pixels) and read by attention. Inspired by complementary learning systems, MERLIN and Neural Episodic Control.
 - Kept as options for later: an archive that restarts more often from recent progress, novelty of dialogues read from the screen, places becoming new again after a key item (with its risks: farming, toggling, touring).
 - Shorter Kaggle sessions (`TIME_LIMIT_HOURS = 4`) during development, to look at results more often.
+
+---
+
+## 2026-10-07 — Route 2, Viridian Forest, and a Game Boy Advance
+
+**Results (`badge_v22_s1`, no memory, old code without the loop breaker):**
+- **Route 2 at ~7.83M steps:** the agent brought Oak's Parcel back and went north, alone, from the bedroom. This is the step the reference project skipped. It did not "know" it had the parcel: it got there by exploring, helped by the archive (which keeps "with the parcel" and "without it" as different states).
+- **Viridian Forest** shortly after: once a wall falls, the next stretch comes fast. The cost of the game is in its walls, not in its length.
+
+**Decided:**
+- Long-term goal: **beat Red with reinforcement learning only, without any help** (no scripted actions, no story flags, no human data, no language models). Written definition of "no help" to be added to `docs/research.md`.
+- A plan for the walls: a toolbox of generic tools (shared archive with action sequences, screen-based archive cells, screen novelty, new-move reward, two-level memory, full resolution, learned skills) and a protocol: diagnose, hypothesis, one generic tool, same-seed comparison. Never code written for one specific wall.
+- Compute: ISCRA-C gives up to 100,000 core-hours on Leonardo GP (an estimated tens of billions of steps, to be measured): enough to make the method, not the compute, the bottleneck. Application with the professor as PI.
+- A PhD student at ETH (Michele Viscione) said winning Gold never seen is almost impossible, and suggested MoE or an orchestrator. Agreed on the first point for zero-shot; the fair version is "never trained on, but learning while playing it", measured as speed. Of his suggestions, a **learned hierarchy of skills** fits the project.
+
+**Done:**
+- **Game Boy Advance support:** an emulator layer (PyBoy for Game Boy, mGBA for GBA through a small libretro frontend in Python, no compilation needed), `scripts/get_mgba_core.py`, and a **FireRed adapter** (pointers to the moving save blocks, encrypted experience, pockets, badges), with Red's milestones on FireRed's maps. The GBA screen is resized to the Game Boy's, so the same model plays both.
+- First question for FireRed: same story as Red, different look. If the Red model does better on FireRed than on Crystal, it learned the story; if badly on both, it learned the pixels.
+
+---
+
+## 2026-10-08 — Shared exploration, continuous replays, the v3 model
+
+**Diagnosis (`badge_v22_s1` at 15.8M steps, stuck in Viridian Forest for ~5M steps):**
+- From the bedroom it reaches Route 2 in 2–4% of episodes and the forest in ~2%, around step 18,000 of a 30,000-step episode: little time left for the forest, Pewter and the gym.
+- It wins more and more battles (`reward/experience` from ~2 to ~6.5): the flee bug is fixed.
+- The curriculum was clogged: 8 demos all the time, none ever completed, starts barely moving back. Three flaws: one snapshot back at a time (a 17,000-step demo has ~265 starting points), one curriculum per parallel game (the Route 2 demo lived in 1 game of 4, competing with "leave the house"), and everything lost at every Kaggle session.
+- Resumed for the night with the new code (loop breaker) and 100,000-step episodes.
+
+**Done (block A, infrastructure):**
+- **Shared exploration:** one archive and one curriculum per title in the training process, fed by all parallel games and **saved next to the checkpoints** (`exploration_<game>.pkl`), so they survive a resume.
+- **Lineage and continuous replays:** every saved state remembers the buttons that led to it from the bedroom. A goal reached in an episode that started from an archived state still produces one continuous replay of the whole game, checked byte for byte by a test.
+- **Faster curriculum:** a tenth of the path back at once when the agent never fails, newer demos chosen more often, snapshots thinned out in long episodes so demos cover the whole path.
+- **Milestones for the whole of Red** (M1–M40, to the Hall of Fame); the goal of the current phase stays M12, `--goal M40` aims at the whole game.
+- **"Without any help" written down** in `docs/research.md` (what is allowed, what is not, how a win is shown).
+
+**Done (block B, the v3 model):** `--downscale 1` (full screen, readable text), `--network impala`, `--gamma 0.999` with `--norm-rewards`, together with `--memory gru`. About 6.6M parameters: GPU only.
+
+**Next:** resume `badge_v22_s1` with block A; start `red_v3_s1` next to it; compare. Then the ISCRA-C draft.
+
+---
+
+## 2026-10-08 — A lost night, Kaggle's queue, and a compute strategy
+
+**What happened:** the resume ran overnight and failed at once: the notebook looked for `red_start.state`, while the dataset had `pokemon_red.state`. A night lost to a file name.
+
+**Done:**
+- The notebook accepts either name for the start state and copies it under the name the code expects.
+- The resume cell takes the `latest.pt` with the most training steps when the inputs hold several (a dataset and an old output together), and prints all of them.
+
+**Learned:**
+- "Queued" on Kaggle means waiting for a free machine. GPU machines are scarce, especially in the evening; an open editor with the GPU on also takes a slot. CPU-only sessions usually start at once and use no weekly quota.
+- CPU-only does not mean more CPUs: both kinds of session have 4 cores. Without a GPU the same 4 cores also do the learning, so it is somewhat slower. Fine for the small network; the v3 model needs the GPU.
+- Plan: the small network (`badge_v22_s1`) runs on CPU every day; the GPU quota goes to `red_v3_s1`.
+- Honest assessment: the small network can plausibly reach the first badge; the whole game needs memory and a larger network, whatever the number of steps.
+
+**Decided:** brute force is not the plan. The whole of Red is estimated at 10–50B steps, years on Kaggle and up to a whole ISCRA-C allocation. Written down in `docs/research.md` (§6.2, "Making every step count"): three levers that raise what each step is worth, each with its test. They are: splitting the game through the agent's own states (Go-Explore, already built), a world model (DreamerV3, a research branch), and more steps per second. Memory is a prerequisite, not a lever. This is also the skeleton of the ISCRA-C application.

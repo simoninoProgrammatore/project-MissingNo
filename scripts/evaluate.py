@@ -43,6 +43,7 @@ def main(args) -> None:
             rom_path=rom,
             start_state_path=state,
             max_steps=args.steps,
+            downscale=policy.downscale,  # the screen the model was trained on
             # No stagnation stop: an evaluation gives the agent its whole time budget.
             rewards=RewardConfig.preset(reward_version).with_weights(
                 stagnation_steps=args.stagnation_steps,

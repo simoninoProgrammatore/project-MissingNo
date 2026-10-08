@@ -7,33 +7,33 @@ demonstration and is never used as training data.
 The state is created with the same emulator mode the environment uses for that
 game (e.g. Yellow in classic Game Boy mode), otherwise it could not be loaded.
 
-Controls (PyBoy defaults): arrows = D-pad, A = a, S = b, Enter = Start,
-Backspace = Select.
+Controls: arrows = D-pad, A = a, S = b, Enter = Start, Backspace = Select
+(Game Boy Advance also: Q = L, W = R).
 
 Usage:
     uv run python scripts/make_start_state.py                          # Red
     uv run python scripts/make_start_state.py --game yellow            # Yellow
+    uv run python scripts/make_start_state.py --game firered           # FireRed (needs the mGBA core)
     uv run python scripts/make_start_state.py --game yellow --rom roms/my_yellow.gbc
 """
 
 import argparse
 from pathlib import Path
 
+from missingno_envs.emulator import make_emulator
 from missingno_games import ADAPTERS, default_rom, default_state
-from pyboy import PyBoy
 
 
 def main(game: str, rom: str, out: str) -> None:
-    cgb = getattr(ADAPTERS[game], "cgb", None)
-    pyboy = PyBoy(rom, window="SDL2", sound_emulated=False, cgb=cgb)
-    pyboy.set_emulation_speed(1)
+    # The same emulator and mode the environment uses for this game.
+    emulator = make_emulator(rom, ADAPTERS[game](), window=True, interactive=True)
+    emulator.set_speed(1)
     print("Play until you are in control in the bedroom, then CLOSE THE WINDOW to save.")
-    while pyboy.tick():
+    while emulator.tick():
         pass
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "wb") as f:
-        pyboy.save_state(f)
-    pyboy.stop(save=False)
+    Path(out).write_bytes(emulator.save_state())
+    emulator.stop()
     print(f"Saved start state to {out}")
 
 

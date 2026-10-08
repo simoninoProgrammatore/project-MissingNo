@@ -65,15 +65,15 @@ To try a new reward **starting from an already trained model**, resume it into a
 uv run python training/ppo.py ... --reward-version v2.1 --run-name v21_from_v2 --resume runs/v2_s1/checkpoints/latest.pt
 ``` When resuming a run, use the same version it was trained with (the script warns you if not).
 
-**State archive** (`--archive-prob 0.5`): a simple form of Go-Explore. Whenever the agent reaches a new region of a map, or makes progress, the emulator state is saved; then half of the episodes start from one of those states instead of the bedroom, favouring the less explored ones. The agent practices where it gets stuck instead of replaying the beginning. All states come from the agent's own play. Episodes started from the archive are logged under `archive/*` and excluded from the milestone curves, which always measure progress from the bedroom. The archive lives in memory and is rebuilt after a resume.
+**State archive** (`--archive-prob 0.5`): a simple form of Go-Explore. Whenever the agent reaches a new region of a map, or makes progress, the emulator state is saved; then half of the episodes start from one of those states instead of the bedroom, favouring the less explored ones. The agent practices where it gets stuck instead of replaying the beginning. All states come from the agent's own play. Episodes started from the archive are logged under `archive/*` and excluded from the milestone curves, which always measure progress from the bedroom. The archive is **shared** by all the parallel games of a title and saved next to the checkpoints (`checkpoints/exploration_<game>.pkl`), so it continues after a resume (`--archive-max-cells`, default 5000; `--no-shared-exploration` gives each parallel game its own, lost at every resume, as in the first runs).
 
 **Archive by learning progress** (`--archive-progress-weight`, default 1): archived states also remember how the episodes started from them went. States where results are changing, i.e. where the agent is currently learning, are chosen more often; too easy or too hard ones less (inspired by Prioritized Level Replay).
 
-**Backward curriculum** (`--curriculum-prob 0.3`): when an episode reaches a map that no episode ever reached before, its path (one saved state every 64 steps) becomes a *demo*. Some episodes then start just before that success; when the agent reaches the goal in at least 4 of the last 8 tries, the start moves one step back, until the whole path is learned. The demos are the agent's own successes: no human data. Logged under `curriculum/*`, excluded from the milestone curves.
+**Backward curriculum** (`--curriculum-prob 0.3`): when an episode reaches a map that no episode ever reached before, its path (one saved state every 64 steps) becomes a *demo*. Some episodes then start just before that success; when the agent reaches the goal in at least 4 of the last 8 tries, the start moves one step back, or a tenth of the path at once if it never failed, until the whole path is learned. Newer demos (the frontier) are chosen more often. In long episodes the saved states are thinned out (one every 128 steps, then 256, ...), so a demo always covers the whole path. Shared and saved like the archive. The demos are the agent's own successes: no human data. Logged under `curriculum/*`, excluded from the milestone curves.
 
 **Self-imitation learning** (`--sil-coef 1.0`): the 5% of actions of each batch that turned out much better than expected are kept in a buffer (~170 MB of RAM for 10,000), and replayed at every learning phase, but only while they are still better than what the agent now expects. A rare success is practiced instead of forgotten. Logged under `sil/*`.
 
-**Final goal and replay** (`--stop-at-goal`): training stops as soon as an episode **from the start state** reaches the last milestone (for Red: the Boulder Badge). Its replay, the start state plus every button pressed, is saved in `runs/<run-name>/replays/`, and the model in `checkpoints/winner.pt`. With several games (see below), training stops when every game has been won at least once. The emulator is deterministic, so the replay reproduces the exact game (the ROM is chosen from the game saved in the replay):
+**Final goal and replay** (`--stop-at-goal`): training stops as soon as an episode reaches the goal milestone (`--goal`, default the game's goal for the current phase: for Red `M12`, the Boulder Badge; `--goal M40` is the whole game, up to the Hall of Fame). Its replay, the start state plus every button pressed **from the bedroom**, is saved in `runs/<run-name>/replays/`, and the model in `checkpoints/winner.pt`. This holds even when the episode started from an archived state: every saved state remembers the buttons that led to it (its *lineage*, see `packages/envs/src/missingno_envs/exploration.py`), and the replay plays them first, so it is always one continuous game played by the agent. With several games (see below), training stops when every game has been won at least once. The emulator is deterministic, so the replay reproduces the exact game (the ROM is chosen from the game saved in the replay):
 
 ```bash
 uv run python scripts/replay.py runs/<run>/replays/goal_red_env0_ep12.npz                  # window, normal speed
@@ -86,6 +86,12 @@ Replays contain the start state, i.e. game data: keep them private, like ROMs.
 **Stagnation** (`--stagnation-steps`): end an episode after this many steps without progress; `0` = never, `-1` = the reward version's default (v2.2: 5,000).
 
 **Battle loops** (`--battle-stagnation-steps`): end an episode after this many steps of one battle without progress; `0` = never, `-1` = the reward version's default (v2.2: 1,000; a normal battle takes a few dozen steps). This catches the *flee loop*: an agent that learned to flee wild battles keeps choosing RUN in a trainer battle, where fleeing is impossible, forever. Ending the episode there makes the loop worth nothing, while winning the battle pays experience. Logged as `episode/battle_loop`. `watch.py` and `evaluate.py` never end episodes early, so loops stay visible.
+
+**The "v3" model** (for the whole game, GPU needed): `--downscale 1` (the full 160×144 screen, so the agent can read the 8×8 letters of dialogues and menus), `--network impala` (deeper eyes with residual blocks, better at generalizing), `--memory gru`, `--gamma 0.999` (a longer horizon) and `--norm-rewards` (rewards scaled by the spread of the discounted return, to keep the critic stable with the longer horizon). About 6.6M parameters: on a CPU it is far too slow, on a T4 GPU the learning phase takes a larger share of the time than with the small model. A run started with these options must be resumed with the same ones (the script checks).
+
+```bash
+uv run python training/ppo.py --downscale 1 --network impala --memory gru --gamma 0.999 --norm-rewards --episode-steps 100000 --archive-prob 0.3 --curriculum-prob 0.3 --sil-coef 1.0 --record-every 8 --stop-at-goal --run-name red_v3_s1
+```
 
 **Short-term memory** (`--memory gru`): without memory the agent decides from the last 3 frames, about one second of game, so it cannot know what is not on the screen: for example that it is carrying Oak's Parcel, which it must bring back south. With `--memory gru` the network carries a small memory (a GRU, `--memory-size 256`) from step to step, wiped at every new episode, and learns by itself what is worth remembering, over stretches of `--num-steps` steps (256 ≈ 100 s of game). Notes:
 
@@ -156,6 +162,22 @@ uv run python scripts/evaluate.py runs/<run>/checkpoints/winner.pt --game crysta
 
 It prints, for every milestone, the fraction of episodes that reached it and the median step. `watch.py --game yellow --checkpoint ...` shows the same model playing in a window.
 
+### Game Boy Advance (FireRed)
+
+Game Boy Advance games run on **mGBA**, loaded as a libretro core (a single file) through a small Python frontend (`packages/envs/src/missingno_envs/libretro.py`). Nothing to compile:
+
+```bash
+uv run python scripts/get_mgba_core.py               # downloads cores/mgba_libretro.<dll|so|dylib>
+uv run pytest tests/test_gba.py                      # checks it works (no game needed)
+uv run python scripts/make_start_state.py --game firered   # play the intro, stop in the bedroom, close the window
+uv run python scripts/evaluate.py runs/<run>/checkpoints/latest.pt --game firered --episodes 10
+```
+
+- ROM: `roms/pokemon_firered.gba`, **English** version 1.0 or 1.1 (other languages have different memory addresses).
+- The GBA screen (240×160) is resized to the Game Boy's (160×144), so the same network plays both consoles. The buttons are the same 7 (L and R are not used).
+- Save states belong to the core version: make the start state and train with the same core. For Kaggle, run `get_mgba_core.py --also-linux` and add `cores/mgba_libretro.so` to your private dataset.
+- FireRed's milestones mirror Red's (bedroom to the Boulder Badge), on FireRed's maps.
+
 ## How the environment works
 
 - **What the agent sees:** only the screen, grayscale, downscaled to 80×72, last 3 frames stacked.
@@ -170,12 +192,13 @@ It prints, for every milestone, the fraction of episodes that reached it and the
 project-MissingNo/
 ├── packages/
 │   ├── core/            # shared types, including ProgressSignals
-│   ├── games/           # one adapter per game (red.py: Red, Blue, Yellow; crystal.py)
+│   ├── games/           # one adapter per game (red.py: Red, Blue, Yellow; crystal.py; firered.py)
 │   ├── envs/            # the Gymnasium environment (PokemonEnv)
 │   └── agents/          # neural networks
 ├── training/            # training scripts (ppo.py)
 ├── notebooks/           # Kaggle notebook
-├── scripts/             # make_start_state, watch, evaluate, replay, benchmark_env
+├── scripts/             # make_start_state, watch, evaluate, replay, get_mgba_core, benchmark_env
+├── cores/               # emulator cores for the Game Boy Advance (ignored by Git)
 ├── runs/                # training logs and checkpoints (ignored by Git)
 ├── tests/
 ├── roms/                # your ROMs (ignored by Git)

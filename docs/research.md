@@ -56,10 +56,27 @@ Written before the experiments. A rejected hypothesis is a result, not a failure
 1. **Pixels only.** The agent observes only the screen. Memory contents are never part of its input.
 2. **Tabula rasa.** No human demonstrations, no pre-trained models, no language models. Everything is learned from interaction.
 3. **"The manual yes, the guide no."** Allowed: anything a player would find in the game's instruction booklet (general mechanics). Not allowed: walkthrough knowledge specific to a game (which tree to cut, where to go next).
-4. **Generic rewards.** The same reward function for every game, computed from game-agnostic progress signals: first visit to a tile, first visit to a map, new badges, new party levels above the best seen. The full design, with edge cases and the planned versions, is in [`rewards.md`](rewards.md).
+4. **Generic rewards.** The same reward function for every game, computed from game-agnostic progress signals: new tiles and maps (worth less the more they were seen), passages, badges, experience, new items and key items, the Pokédex. The full design, with edge cases and the planned versions, is in [`rewards.md`](rewards.md).
 5. **Adapters for rewards and evaluation only.** One small adapter per game reads its memory to compute rewards and milestones. This privileged information is used *by the training and evaluation code*, never by the agent.
 6. **Game-specific milestones are for measuring, not for rewarding.** Milestones (e.g. "reached Viridian City") are defined per game to evaluate progress; they never enter the reward.
 7. **Pre-registration.** Hypotheses, held-out games, budgets and cost gates are written in this document before running the corresponding experiments.
+
+### 4.1 What "without any help" means
+
+The long-term goal is to **beat Pokémon Red with reinforcement learning only, without any help**. To make the claim checkable, the rules are fixed here:
+
+| Allowed | Not allowed |
+|---|---|
+| A start state after the intro (names, Oak's speech): it is setup, not gameplay | Starting after the first Pokémon, after Oak's Parcel, or anywhere later |
+| The 7 buttons, one every 24 frames | Scripted actions: automatic use of HMs or items, automatic puzzle solving, automatic Poké Flute, skipped areas |
+| Generic rewards from manual-level concepts: new places, passages, badges, experience, items and key items as the game itself defines them, the Pokédex, new dialogues or screens read from the pixels | Story event flags, rewards for specific places, people, trees, boulders or items ("the guide") |
+| Exploration helpers built from the agent's own play: archive, curriculum, self-imitation | Human games, walkthroughs, language models, pre-trained models |
+| The game as it is | Cheats: infinite money or health, changed encounter rates, edited RAM |
+| Milestones read from memory, only to measure | Milestones, or anything read from memory, as input to the agent |
+
+Any exception (for example, an HM-specific reward to test a hypothesis) is a separate, declared experiment, and is never part of the main result. A win is shown by a **continuous replay from the bedroom**: the start state plus every button the agent pressed, which the deterministic emulator reproduces exactly (archived states included, through their lineage; see `packages/envs/src/missingno_envs/exploration.py`).
+
+Reference point: Pokémon RL Edition (2025) finished Red with scripted HMs, automatic boulder puzzles, an automatic Poké Flute, infinite money and story-event rewards; it could finish the game with any one of its helps removed, but not with all of them removed at once.
 
 **Plan B (declared in advance).** If generic rewards and structured exploration prove insufficient, human demonstrations are added as an *additional, separately reported* experiment. This would change the main claim, and would be stated as such.
 
@@ -69,8 +86,8 @@ Written before the experiments. A rejected hypothesis is a result, not a failure
 
 ### 5.1 Environment (implemented)
 
-- **Emulator:** PyBoy (Game Boy / Game Boy Color). A GBA emulator (mGBA) will be needed for Generation 3.
-- **Observation:** grayscale screen, downscaled 2× to 80×72, last 3 frames stacked.
+- **Emulator:** PyBoy (Game Boy / Game Boy Color); mGBA through a small libretro frontend for Generation 3, with the screen resized to the Game Boy's.
+- **Observation:** grayscale screen, last 3 frames stacked; downscaled 2× to 80×72 (`--downscale 2`, the first model) or at full resolution, 160×144 (`--downscale 1`, the v3 model).
 - **Actions:** 7 buttons (down, left, right, up, A, B, Start), one decision every 24 frames.
 - **Episodes:** start from a fixed state after the intro (the intro is setup, played once by hand), fixed maximum length.
 - **Interface:** standard Gymnasium environment, deterministic resets, tested.
@@ -133,6 +150,23 @@ If a gate is not met, we stop, analyse why, and revise the approach before spend
 **Experiments:** random, PPO, PPO + RND, PPO + Go-Explore. Same budget (target: 100M steps), 3 seeds each.
 
 **Deliverables for review:** learning curves with milestone markers, a table of steps and core-hours per milestone, a video of the best agent, and an extrapolated compute estimate for Phase 2.
+
+### 6.2 Making every step count
+
+**The problem.** By brute force, the whole of Red is estimated at 10–50B steps (Section 7). On Kaggle (~400 steps/s) that is about 290 days for 10B and 4 years for 50B; on Leonardo, at an estimated ~0.5B steps per node-day (to be measured), about 20 node-days (~2,000 GPU-hours) for 10B and about 100 node-days (close to a whole ISCRA-C allocation) for 50B. The goal is therefore not "more steps" but **more learning per step**. Three levers, none of which breaks the rules of Section 4.1:
+
+**Lever 1 — Split the game through the agent's own states (implemented, being measured).** If every episode starts from the bedroom, practising a late stretch means replaying everything before it, so the cost of the game grows with its length times the number of attempts. The archive and the backward curriculum restart episodes from states **the agent itself reached**, so it practises the new stretch directly: the cost adds up stretch by stretch instead. This is the idea behind Go-Explore, which solved Montezuma's Revenge. The archive and curriculum are shared by all parallel games and saved across sessions, and a win is still shown as one continuous replay from the bedroom (lineage, Section 4.1).
+*Test:* in `badge_v22_s1`, does the shared curriculum make the trip back with Oak's Parcel consistent (`milestones/M8_rate`), where the per-game curriculum did not?
+
+**Lever 2 — A world model (research branch, after the v3 baseline).** The agent also learns *how the game works* (what it will see after pressing a button) and trains in its own imagination, so every real step is reused many times. DreamerV3 learned to collect diamonds in Minecraft from scratch, without human data, with far fewer interactions than model-free methods. Costs: more GPU per step, and a new learner to build, not a flag. It is the most promising answer to the main question, and the natural object of a larger allocation.
+*Test:* on the Phase 1 segment and up to the first badge, steps per milestone of a world-model agent against PPO, same rewards and observations.
+
+**Lever 3 — More steps per second on the same hardware.** Profile one environment step (emulation, memory reads, image resizing, reward) and remove what is not needed; on HPC nodes, run actors asynchronously so all cores emulate while the GPUs learn. It does not change the order of magnitude, but a 2–3× gain is worth a month of free compute.
+*Test:* measured steps/s of the v3 model on one GPU (first `red_v3_s1` run), then on a Leonardo node.
+
+**Memory is a prerequisite, not a lever.** Many later states look identical on screen but need different actions (carrying the parcel or not, holding the Silph Scope or not). A memoryless policy cannot tell them apart with any number of steps; with too small a network, learning later areas erases earlier ones. More compute does not fix either: this is why the v3 model (IMPALA encoder, GRU, γ = 0.999) is the base for the whole game, and the current small network the base for the first badge only.
+
+**For the ISCRA-C application.** Not "a lot of compute for brute force" but: a method that cuts the compute needed (levers 1 and 2), a measured cost per milestone and a measured throughput, and a game nobody has beaten without help.
 
 ---
 
@@ -213,7 +247,10 @@ No ROMs or save states are distributed. Anyone running the code must use legally
 - Schulman et al. *Proximal Policy Optimization Algorithms.* 2017
 - Burda et al. *Exploration by Random Network Distillation.* 2018
 - Ecoffet et al. *First return, then explore* (Go-Explore). Nature 2021
-- Hafner et al. *Mastering Diverse Domains through World Models* (DreamerV3). 2023
+- Hafner et al. *Mastering Diverse Domains through World Models* (DreamerV3). 2023; Nature 2025
+- Salimans, Chen. *Learning Montezuma's Revenge from a Single Demonstration.* 2018
+- Oh et al. *Self-Imitation Learning.* ICML 2018
+- Espeholt et al. *IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures.* ICML 2018
 - Cobbe et al. *Leveraging Procedural Generation to Benchmark Reinforcement Learning* (Procgen). 2020
 - Baker et al. *Video PreTraining (VPT).* 2022
 - Sutton. *The Bitter Lesson.* 2019

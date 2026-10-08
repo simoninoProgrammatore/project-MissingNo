@@ -89,10 +89,34 @@ OAKS_LAB = 40
 VIRIDIAN_MART = 42
 VIRIDIAN_FOREST = 51
 PEWTER_GYM = 54
-OAKS_PARCEL = 0x46
+CERULEAN_CITY = 3
+LAVENDER_TOWN = 4
+CELADON_CITY = 6
+FUCHSIA_CITY = 7
+CINNABAR_ISLAND = 8
+INDIGO_PLATEAU = 9
+ROUTE_3 = 14
+MT_MOON_1F = 59
+ROCK_TUNNEL_1F = 82
+BILLS_HOUSE = 88
+SS_ANNE_1F = 95
+VICTORY_ROAD_1F = 108
+HALL_OF_FAME = 118
+SILPH_CO_1F = 181
+ROCKET_HIDEOUT_B1F = 199
 
-# Milestones: from the bedroom to the first badge. Used ONLY to measure progress,
-# never as rewards. The last one is the final goal of the current phase.
+# Items (pret/pokered constants/item_constants.asm, verified).
+OAKS_PARCEL = 0x46
+S_S_TICKET = 0x3F
+SILPH_SCOPE = 0x48
+POKE_FLUTE = 0x49
+HM_CUT, HM_SURF, HM_STRENGTH = 0xC4, 0xC6, 0xC7
+
+# Milestones: from the bedroom to the Hall of Fame, in story order. Used ONLY to
+# measure progress, never as rewards. M12 (the first badge) is the goal of the
+# current phase (`goal` below); --goal M40 aims at the whole game. Some stretches
+# can be done in a different order (e.g. the 6th and 7th badges): milestones that
+# count badges say "the N-th badge" for that reason.
 MILESTONES: tuple[Milestone, ...] = (
     Milestone("M1", "Leave the bedroom", lambda s: s.map_id == REDS_HOUSE_1F),
     Milestone("M2", "Leave the house", lambda s: s.map_id == PALLET_TOWN),
@@ -107,6 +131,34 @@ MILESTONES: tuple[Milestone, ...] = (
     Milestone("M10", "Reach Pewter City", lambda s: s.map_id == PEWTER_CITY),
     Milestone("M11", "Enter Pewter Gym", lambda s: s.map_id == PEWTER_GYM),
     Milestone("M12", "Win the Boulder Badge", lambda s: s.badges >= 1),
+    Milestone("M13", "Reach Route 3", lambda s: s.map_id == ROUTE_3),
+    Milestone("M14", "Enter Mt. Moon", lambda s: s.map_id == MT_MOON_1F),
+    Milestone("M15", "Reach Cerulean City", lambda s: s.map_id == CERULEAN_CITY),
+    Milestone("M16", "Win the 2nd badge (Cascade)", lambda s: s.badges >= 2),
+    Milestone("M17", "Reach Bill's house", lambda s: s.map_id == BILLS_HOUSE),
+    Milestone("M18", "Get the S.S. Ticket", lambda s: S_S_TICKET in s.items),
+    Milestone("M19", "Board the S.S. Anne", lambda s: s.map_id == SS_ANNE_1F),
+    Milestone("M20", "Get HM01 (Cut)", lambda s: HM_CUT in s.items),
+    Milestone("M21", "Win the 3rd badge (Thunder)", lambda s: s.badges >= 3),
+    Milestone("M22", "Enter Rock Tunnel", lambda s: s.map_id == ROCK_TUNNEL_1F),
+    Milestone("M23", "Reach Lavender Town", lambda s: s.map_id == LAVENDER_TOWN),
+    Milestone("M24", "Reach Celadon City", lambda s: s.map_id == CELADON_CITY),
+    Milestone("M25", "Win the 4th badge (Rainbow)", lambda s: s.badges >= 4),
+    Milestone("M26", "Enter the Rocket Hideout", lambda s: s.map_id == ROCKET_HIDEOUT_B1F),
+    Milestone("M27", "Get the Silph Scope", lambda s: SILPH_SCOPE in s.items),
+    Milestone("M28", "Get the Poké Flute", lambda s: POKE_FLUTE in s.items),
+    Milestone("M29", "Reach Fuchsia City", lambda s: s.map_id == FUCHSIA_CITY),
+    Milestone("M30", "Win the 5th badge", lambda s: s.badges >= 5),
+    Milestone("M31", "Get HM03 (Surf)", lambda s: HM_SURF in s.items),
+    Milestone("M32", "Get HM04 (Strength)", lambda s: HM_STRENGTH in s.items),
+    Milestone("M33", "Enter Silph Co.", lambda s: s.map_id == SILPH_CO_1F),
+    Milestone("M34", "Win the 6th badge", lambda s: s.badges >= 6),
+    Milestone("M35", "Reach Cinnabar Island", lambda s: s.map_id == CINNABAR_ISLAND),
+    Milestone("M36", "Win the 7th badge", lambda s: s.badges >= 7),
+    Milestone("M37", "Win the 8th badge (Earth)", lambda s: s.badges >= 8),
+    Milestone("M38", "Enter Victory Road", lambda s: s.map_id == VICTORY_ROAD_1F),
+    Milestone("M39", "Reach Indigo Plateau", lambda s: s.map_id == INDIGO_PLATEAU),
+    Milestone("M40", "Enter the Hall of Fame (beat the game)", lambda s: s.map_id == HALL_OF_FAME),
 )
 
 
@@ -124,6 +176,7 @@ class RedAdapter:
     name = "red"
     rom_sha1 = "ea9bcae617fdf159b045185467ae58b2e4a48b9a"
     milestones = MILESTONES
+    goal = "M12"  # the goal of the current phase: the first badge (--goal to change it)
     offset = 0  # address shift relative to Red
     cgb: bool | None = None  # None = let the emulator decide; False = force the classic Game Boy
 

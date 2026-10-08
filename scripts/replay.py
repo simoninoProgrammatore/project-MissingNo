@@ -14,12 +14,11 @@ Usage:
 """
 
 import argparse
-import io
 
 import numpy as np
 from missingno_envs import ACTIONS
+from missingno_envs.emulator import make_emulator
 from missingno_games import ADAPTERS, default_rom
-from pyboy import PyBoy
 
 
 def main(args) -> None:
@@ -31,14 +30,13 @@ def main(args) -> None:
     names = list(data["milestone_names"])
     adapter = ADAPTERS[game]() if game in ADAPTERS else None
 
-    window = "null" if args.video else "SDL2"
     rom = args.rom or default_rom(game)
-    # Same emulator mode as in training (e.g. Yellow in classic Game Boy mode).
-    cgb = getattr(adapter, "cgb", None)
-    pyboy = PyBoy(rom, window=window, sound_emulated=False, cgb=cgb)
-    pyboy.set_emulation_speed(0 if args.video else args.speed)
-    pyboy.load_state(io.BytesIO(data["start_state"].tobytes()))
-    pyboy.tick(1, True)
+    # The same emulator and mode as in training (e.g. Yellow in classic Game Boy mode,
+    # FireRed with mGBA).
+    emulator = make_emulator(rom, adapter, window=not args.video)
+    emulator.set_speed(0 if args.video else args.speed)
+    emulator.load_state(data["start_state"].tobytes())
+    emulator.tick(1, True)
 
     writer = None
     if args.video:
@@ -46,22 +44,32 @@ def main(args) -> None:
 
         writer = imageio.get_writer(args.video, fps=60, macro_block_size=1)
 
+    # Replays made from archived states have several segments (see exploration.py):
+    # after each one the training environment had loaded a state and advanced one
+    # frame, so the replay does the same.
+    starts = set(data["segment_starts"].tolist()) if "segment_starts" in data else {0}
+    starts.discard(0)  # the first frame after loading the start state is done above
     minutes = len(actions) * frames_per_action / 60 / 60
-    print(f"{game}: {len(actions):,} actions, about {minutes:.0f} minutes of game time")
+    print(
+        f"{game}: {len(actions):,} actions in {len(starts) + 1} segment(s), "
+        f"about {minutes:.0f} minutes of game time"
+    )
     reached = set()
     frame_count = 0
     for step, action in enumerate(actions, start=1):
-        pyboy.button(ACTIONS[int(action)], press_frames)
+        if step - 1 in starts:
+            emulator.tick(1, True)
+        emulator.press(ACTIONS[int(action)], press_frames)
         for _ in range(frames_per_action):
-            if not pyboy.tick(1, True):
+            if not emulator.tick(1, True):
                 print("Window closed.")
                 return
             frame_count += 1
             if writer is not None and frame_count % args.video_speed == 0:
-                writer.append_data(pyboy.screen.ndarray[:, :, :3])
+                writer.append_data(emulator.screen())
         if adapter is None:
             continue
-        signals = adapter.read(pyboy.memory)
+        signals = adapter.read(emulator.memory)
         for m in adapter.milestones:
             if m.id not in reached and m.reached(signals):
                 reached.add(m.id)
@@ -73,14 +81,16 @@ def main(args) -> None:
         writer.close()
         print(f"Saved video: {args.video}")
     if adapter is not None:
-        final = names[-1] if names else "goal"
-        ok = adapter.milestones[-1].id in reached
-        print(f"Replay {'reproduced' if ok else 'did NOT reproduce'} the final goal: {final}")
+        ids = [m.id for m in adapter.milestones]
+        goal = str(data["goal"]) if "goal" in data else ids[-1]
+        final = names[ids.index(goal)] if goal in ids and names else goal
+        ok = goal in reached
+        print(f"Replay {'reproduced' if ok else 'did NOT reproduce'} the goal: {final}")
     if not args.video:
         print("Close the window to exit.")
-        while pyboy.tick():
+        while emulator.tick():
             pass
-    pyboy.stop(save=False)
+    emulator.stop()
 
 
 if __name__ == "__main__":

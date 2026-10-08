@@ -1,4 +1,4 @@
-"""Gymnasium environment for Pokémon games running in PyBoy.
+"""Gymnasium environment for Pokémon games (PyBoy for Game Boy, mGBA for GBA).
 
 Design rules (see docs/research.md and docs/rewards.md):
 - The agent observes ONLY the screen (grayscale, downscaled, last frames stacked).
@@ -10,10 +10,9 @@ Design rules (see docs/research.md and docs/rewards.md):
 from __future__ import annotations
 
 import hashlib
-import io
 import warnings
 import zlib
-from collections import deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,15 +21,20 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 from missingno_core import ProgressSignals
-from missingno_games import GameAdapter
-from pyboy import PyBoy
+from missingno_games import GameAdapter, goal_index
 
-from missingno_envs.archive import StateArchive
-from missingno_envs.curriculum import BackwardCurriculum, Demo
+from missingno_envs.archive import cell_key
+from missingno_envs.emulator import make_emulator
+from missingno_envs.exploration import START, ExplorationHub, compress, write_replay
 from missingno_envs.rewards import RewardConfig, RewardTracker
 
-# The agent's buttons. SELECT is left out: it is almost never needed.
+# The agent's buttons. SELECT is left out: it is almost never needed. The Game Boy
+# Advance's L and R are left out too, so the same agent plays every console.
 ACTIONS: tuple[str, ...] = ("down", "left", "right", "up", "a", "b", "start")
+
+# Every screen is brought to the Game Boy's size before the agent sees it, so the same
+# network plays every console (the Game Boy Advance's 240x160 screen is resized).
+SCREEN_HEIGHT, SCREEN_WIDTH = 144, 160
 
 
 @dataclass
@@ -53,18 +57,26 @@ class EnvConfig:
     # curriculum.py). Probability that an episode starts from a demo. 0 = off.
     curriculum_prob: float = 0.0
     curriculum_interval: int = 64  # steps between saved states along each episode
+    curriculum_max_snapshots: int = 400  # per episode; then they are thinned out
+    # Shared exploration (exploration.py): the archive and the curriculum live in the
+    # training process, shared by all parallel games. The environment reports what it
+    # finds (`drain`) and starts its episodes from `pending_starts`. False = this
+    # environment keeps its own archive and curriculum (one game alone, tests, scripts).
+    shared_exploration: bool = False
     # Recording for GIFs: keep one full-resolution grayscale frame every N steps of
     # each episode started from the start state, and save it when the episode ends.
     # 0 = off. Recordings are compressed .npz files in `record_dir`.
     record_every: int = 0
     record_dir: str | None = None
     record_tag: str = "env"
-    # Final goal: when an episode from the start state reaches the adapter's last
-    # milestone (e.g. the first badge), the episode ends and its replay is saved:
-    # start state + every button pressed. The emulator is deterministic, so the
-    # replay reproduces the exact game (scripts/replay.py), at any speed.
+    # Final goal: when an episode reaches the goal milestone (`goal`, default the
+    # adapter's own, e.g. the first badge), the episode ends and its replay is saved:
+    # start state + every button pressed, from the bedroom, even if the episode started
+    # from an archived state (its lineage is replayed first, see exploration.py). The
+    # emulator is deterministic, so the replay reproduces the exact game.
     stop_at_goal: bool = False
     replay_dir: str | None = None
+    goal: str | None = None  # a milestone id, e.g. "M12"; None = the adapter's goal
 
 
 class PokemonEnv(gym.Env):
@@ -82,57 +94,64 @@ class PokemonEnv(gym.Env):
         self.adapter = adapter
         self.rewards = config.rewards or RewardConfig()
         self._tracker = RewardTracker(self.rewards)
-        self.archive = (
-            StateArchive(max_cells=config.archive_max_cells) if config.archive_prob > 0 else None
-        )
-        if self.archive is not None:
-            self.archive.progress_weight = config.archive_progress_weight
-        self._from_archive = False
-        self._archive_cell = None
-        self.curriculum = (
-            BackwardCurriculum(interval=config.curriculum_interval)
-            if config.curriculum_prob > 0
+        self._use_archive = config.archive_prob > 0
+        self._use_curriculum = config.curriculum_prob > 0
+        # Local mode: a private hub. Shared mode: the training process has the hub.
+        self.hub = (
+            ExplorationHub(
+                archive_prob=config.archive_prob,
+                curriculum_prob=config.curriculum_prob,
+                archive_max_cells=config.archive_max_cells,
+                archive_progress_weight=config.archive_progress_weight,
+                curriculum_interval=config.curriculum_interval,
+            )
+            if (self._use_archive or self._use_curriculum) and not config.shared_exploration
             else None
         )
-        self._demo: Demo | None = None
-        self._snapshots: list[bytes] = []
+        if self.hub is not None and self.hub.curriculum is not None:
+            self.hub.curriculum.max_snapshots = config.curriculum_max_snapshots
+        self.pending_starts: list[dict] = []  # shared mode: set by the training process
+        self.known_maps: set[int] = set()  # shared mode: maps any game has reached
+        self._outbox: dict = defaultdict(list)
+        self._visits: Counter = Counter()
+        self._known_cells: set = set()  # cells this environment already reported
         self._maps_ever: set[int] = set()  # maps reached in any episode so far
+        self._spec: dict = dict(START)
+        self._node = 0  # lineage node this episode started from
+        self._actions = bytearray()  # buttons pressed in this episode
+        self._snapshots: list[tuple[int, bytes]] = []  # (step, compressed state)
+        self._snap_interval = config.curriculum_interval
         self._recording: list[np.ndarray] | None = None
         self._episode_index = 0
         self._last_recording = ""
-        self._actions: list[int] | None = None
+        self._goal = goal_index(adapter, config.goal)
         self._goal_reached = False
+        self._goal_report: dict | None = None
         self._last_replay = ""
         self.render_mode = render_mode
 
         _check_rom(config.rom_path, adapter)
-        window = "SDL2" if render_mode == "human" else "null"
-        # Some adapters force the classic Game Boy mode (e.g. Yellow), see games/red.py.
-        self.pyboy = PyBoy(
-            config.rom_path, window=window, sound_emulated=False, cgb=getattr(adapter, "cgb", None)
-        )
+        # PyBoy for Game Boy games, mGBA for Game Boy Advance ones (see emulator.py). Some
+        # adapters force the classic Game Boy mode (e.g. Yellow), see games/red.py.
+        self.emulator = make_emulator(config.rom_path, adapter, window=render_mode == "human")
         # 0 = as fast as possible; 1 = real time (only useful when watching)
-        self.pyboy.set_emulation_speed(emulation_speed if render_mode == "human" else 0)
+        self.emulator.set_speed(emulation_speed if render_mode == "human" else 0)
 
         if config.start_state_path:
             self._start_state = Path(config.start_state_path).read_bytes()
             try:
-                self.pyboy.load_state(io.BytesIO(self._start_state))
+                self.emulator.load_state(self._start_state)
             except Exception as error:
-                import pyboy as _pyboy
-
                 raise RuntimeError(
-                    f"Cannot load the start state {config.start_state_path} with PyBoy "
-                    f"{getattr(_pyboy, '__version__', '?')}: {error}\n"
-                    "Save states are NOT compatible across PyBoy versions. Use the PyBoy "
-                    "version that created it (see uv.lock), or recreate it with "
+                    f"Cannot load the start state {config.start_state_path} with "
+                    f"{self.emulator.version()}: {error}\n"
+                    "Save states are NOT compatible across emulator versions. Use the version "
+                    "that created it (see uv.lock), or recreate it with "
                     "scripts/make_start_state.py."
                 ) from error
         else:
             # No start state: snapshot the power-on state, so every reset is identical.
-            buffer = io.BytesIO()
-            self.pyboy.save_state(buffer)
-            self._start_state = buffer.getvalue()
+            self._start_state = self.emulator.save_state()
 
         height = 144 // config.downscale
         width = 160 // config.downscale
@@ -152,32 +171,26 @@ class PokemonEnv(gym.Env):
         super().reset(seed=seed)
         cfg = self.config
         # Where does this episode start? A demo, an archived state, or the start state.
-        r = self.np_random.random()
-        self._demo, self._archive_cell, self._from_archive = None, None, False
-        if self.curriculum is not None and len(self.curriculum) > 0 and r < cfg.curriculum_prob:
-            self._demo, state = self.curriculum.sample(self.np_random)
-        elif (
-            self.archive is not None
-            and len(self.archive) > 0
-            and r < cfg.curriculum_prob + cfg.archive_prob
-        ):
-            self._archive_cell, state = self.archive.sample(self.np_random)
-            self._from_archive = True
-        else:
-            state = self._start_state
-        self.pyboy.load_state(io.BytesIO(state))
-        self.pyboy.tick(1, True)
-        self._snapshots = [zlib.compress(state, 1)] if self.curriculum is not None else []
+        self._spec = self._next_start()
+        kind = self._spec["kind"]
+        state = self._start_state if kind == "start" else zlib.decompress(self._spec["state"])
+        self._node = self._spec.get("node", 0)
+        self.emulator.load_state(state)
+        self.emulator.tick(1, True)
+        self._actions = bytearray()
+        self._snap_interval = cfg.curriculum_interval
+        self._snapshots = [(0, compress(state))] if self._use_curriculum else []
         # Record only episodes from the start state: they show real progress.
-        from_start = self._demo is None and not self._from_archive
-        self._recording = [] if cfg.record_every > 0 and cfg.record_dir and from_start else None
+        self._recording = (
+            [] if cfg.record_every > 0 and cfg.record_dir and kind == "start" else None
+        )
         self._last_recording = ""
         self._episode_index += 1
-        self._actions: list[int] | None = [] if cfg.stop_at_goal and from_start else None
         self._goal_reached = False
+        self._goal_report = None
         self._last_replay = ""
 
-        signals = self.adapter.read(self.pyboy.memory)
+        signals = self.adapter.read(self.emulator.memory)
         self._maps_ever.add(signals.map_id)
         self._tracker.reset(signals)
         self._steps = 0
@@ -193,19 +206,18 @@ class PokemonEnv(gym.Env):
     def step(self, action: int):
         button = ACTIONS[int(action)]
         cfg = self.config
-        if self._actions is not None:
-            self._actions.append(int(action))
-        self.pyboy.button(button, cfg.press_frames)
+        self._actions.append(int(action))
+        self.emulator.press(button, cfg.press_frames)
         # Render only the last frame: much faster, and it's the one we observe.
-        self.pyboy.tick(cfg.frames_per_action - 1, False)
-        self.pyboy.tick(1, True)
+        self.emulator.tick(cfg.frames_per_action - 1, False)
+        self.emulator.tick(1, True)
         self._steps += 1
 
-        signals = self.adapter.read(self.pyboy.memory)
+        signals = self.adapter.read(self.emulator.memory)
         reward, parts = self._tracker.step(signals, self._steps)
         self._update_milestones(signals)
-        if self.archive is not None:
-            self.archive.observe(signals, self._save_state)
+        if self._use_archive:
+            self._archive_step(signals)
         demo_success = self._curriculum_step(signals)
         self._frames.append(self._grab_frame())
         if self._recording is not None and self._steps % cfg.record_every == 0:
@@ -214,10 +226,13 @@ class PokemonEnv(gym.Env):
         terminated = False  # Pokémon has no "game over": only time limits
         stop_reason = self._tracker.stop_reason(self._steps)
         stagnated = stop_reason != ""
-        max_steps = self._demo.budget() if self._demo is not None else cfg.max_steps
-        if self._actions is not None and self._milestone_step[-1] >= 0:
-            self._goal_reached = True  # final milestone, in an episode from the start
-            self._save_replay()
+        demo = self._spec["kind"] == "demo"
+        max_steps = self._spec["budget"] if demo else cfg.max_steps
+        # The goal counts in any episode, as long as it was reached during the episode
+        # (an archived state may already have it at step 0).
+        if not self._goal_reached and self._milestone_step[self._goal] > 0 and cfg.stop_at_goal:
+            self._goal_reached = True
+            self._on_goal()
         truncated = self._steps >= max_steps or stagnated or demo_success or self._goal_reached
         if truncated:
             self._end_episode(demo_success)
@@ -226,43 +241,117 @@ class PokemonEnv(gym.Env):
         info["stagnated"] = stagnated
         # Ended stuck in a battle (e.g. choosing RUN in a trainer battle, forever).
         info["battle_loop"] = stop_reason == "battle"
+        if self._goal_report is not None:
+            info["goal_report"] = self._goal_report
         return self._observation(), reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode == "rgb_array":
-            return self.pyboy.screen.ndarray[:, :, :3].copy()
-        return None  # "human": the PyBoy window is already showing the game
+            return self.emulator.screen().copy()
+        return None  # "human": the emulator's window is already showing the game
 
     def close(self) -> None:
-        self.pyboy.stop(save=False)
+        self.emulator.stop()
+
+    @property
+    def pyboy(self):
+        """Old name of `emulator`, kept for scripts written before the Game Boy Advance."""
+        return self.emulator
+
+    @property
+    def archive(self):
+        """This environment's own archive (local mode), None otherwise."""
+        return self.hub.archive if self.hub is not None else None
+
+    @property
+    def curriculum(self):
+        return self.hub.curriculum if self.hub is not None else None
+
+    # ------------------------------------------------- shared exploration protocol
+
+    def drain(self) -> dict:
+        """Shared mode: everything found since the last call (see ExplorationHub.absorb)."""
+        report = dict(self._outbox)
+        report["visits"] = dict(self._visits)
+        report["maps"] = set(self._maps_ever)
+        self._outbox = defaultdict(list)
+        self._visits = Counter()
+        return report
+
+    def start_state(self) -> bytes:
+        return self._start_state
 
     # ------------------------------------------------------------ internals
+
+    def _next_start(self) -> dict:
+        if self.config.shared_exploration:
+            return self.pending_starts.pop(0) if self.pending_starts else dict(START)
+        if self.hub is not None:
+            return self.hub.next_start(self.np_random)
+        return dict(START)
+
+    def _emit(self, kind: str, item) -> None:
+        """Report a discovery: to the shared hub (later) or to the private one (now)."""
+        if self.hub is not None:
+            self.hub.absorb({kind: [item]})
+        else:
+            self._outbox[kind].append(item)
+
+    def _archive_step(self, s: ProgressSignals) -> None:
+        key = cell_key(s)
+        if key in self._known_cells:
+            if self.hub is not None:
+                self.hub.archive.add_visits(key, 1)
+            else:
+                self._visits[key] += 1
+            return
+        self._known_cells.add(key)
+        self._emit("cells", (key, compress(self._save_state()), self._node, self._lineage()))
+
+    def _lineage(self) -> bytes:
+        return compress(self._actions)
 
     def _curriculum_step(self, s: ProgressSignals) -> bool:
         """Save states along the way; turn a first-ever new map into a demo.
 
         Returns True if this episode started from a demo and just reached its goal.
         """
-        if self.curriculum is None:
-            self._maps_ever.add(s.map_id)
+        demo_episode = self._spec["kind"] == "demo"
+        new_map = s.map_id not in self._maps_ever and s.map_id not in self.known_maps
+        self._maps_ever.add(s.map_id)
+        if not self._use_curriculum:
             return False
-        cur = self.curriculum
-        if self._steps % cur.interval == 0 and len(self._snapshots) < cur.max_snapshots:
-            self._snapshots.append(zlib.compress(self._save_state(), 1))
-        if s.map_id not in self._maps_ever:
-            self._maps_ever.add(s.map_id)
-            if self._demo is None:  # a demo episode just repeats a known success
-                # A snapshot taken at this very step is already at the goal: skip it.
-                taken_now = self._steps % cur.interval == 0 and len(self._snapshots) > 1
-                cur.add_demo(self._snapshots[:-1] if taken_now else self._snapshots, s.map_id)
-        return self._demo is not None and s.map_id == self._demo.target_map
+        if self._steps % self._snap_interval == 0:
+            self._snapshots.append((self._steps, compress(self._save_state())))
+            if len(self._snapshots) > self.config.curriculum_max_snapshots:
+                # Long episode: keep every other snapshot, and save half as often from now.
+                self._snapshots = self._snapshots[::2]
+                self._snap_interval *= 2
+        if new_map and not demo_episode:  # a demo episode just repeats a known success
+            # A snapshot taken at this very step is already at the goal: leave it out.
+            snaps = [(o, st) for o, st in self._snapshots if o < self._steps] or self._snapshots
+            self._emit(
+                "demos",
+                (
+                    s.map_id,
+                    self._node,
+                    self._lineage(),
+                    [st for _, st in snaps],
+                    [o for o, _ in snaps],
+                    self._steps,
+                ),
+            )
+        return demo_episode and s.map_id == self._spec["target_map"]
 
     def _end_episode(self, demo_success: bool) -> None:
         """Report the outcome of the episode to the archive and the curriculum."""
-        if self._demo is not None and self.curriculum is not None:
-            self.curriculum.record(self._demo, demo_success)
-        if self._archive_cell is not None and self.archive is not None:
-            self.archive.record_outcome(self._archive_cell, sum(self._tracker.totals.values()))
+        kind = self._spec["kind"]
+        if kind == "demo":
+            self._emit("outcomes", ("demo", self._spec["demo"], demo_success))
+        elif kind == "archive":
+            self._emit(
+                "outcomes", ("archive", self._spec["key"], sum(self._tracker.totals.values()))
+            )
         if self._recording:
             path = (
                 Path(self.config.record_dir)
@@ -273,28 +362,30 @@ class PokemonEnv(gym.Env):
             self._last_recording = str(path)
             self._recording = None
 
-    def _save_replay(self) -> None:
+    def replay_meta(self) -> dict:
         cfg = self.config
-        folder = Path(cfg.replay_dir or ".")
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"goal_{cfg.record_tag}_ep{self._episode_index}.npz"
-        np.savez_compressed(
-            path,
-            actions=np.asarray(self._actions, dtype=np.uint8),
-            start_state=np.frombuffer(self._start_state, dtype=np.uint8),
-            frames_per_action=cfg.frames_per_action,
-            press_frames=cfg.press_frames,
-            game=self.adapter.name,
-            milestone_step=self._milestone_step,
-            milestone_names=np.array([m.name for m in self.adapter.milestones]),
+        return {
+            "frames_per_action": cfg.frames_per_action,
+            "press_frames": cfg.press_frames,
+            "game": self.adapter.name,
+            "goal": self.adapter.milestones[self._goal].id,
+            "milestone_names": np.array([m.name for m in self.adapter.milestones]),
+        }
+
+    def _on_goal(self) -> None:
+        """The goal: save the replay (here, or in the training process in shared mode)."""
+        self._goal_report = {"node": self._node, "actions": bytes(self._actions)}
+        if self.config.shared_exploration:
+            return  # the training process has the lineage: it writes the replay
+        cfg = self.config
+        path = Path(cfg.replay_dir or ".") / f"goal_{cfg.record_tag}_ep{self._episode_index}.npz"
+        segments = self.hub.chain(self._node) if self.hub is not None else []
+        self._last_replay = write_replay(
+            path, self._start_state, [*segments, bytes(self._actions)], **self.replay_meta()
         )
-        self._last_replay = str(path)
-        self._actions = None
 
     def _save_state(self) -> bytes:
-        buffer = io.BytesIO()
-        self.pyboy.save_state(buffer)
-        return buffer.getvalue()
+        return self.emulator.save_state()
 
     def _update_milestones(self, s: ProgressSignals) -> None:
         for i, milestone in enumerate(self.adapter.milestones):
@@ -302,7 +393,10 @@ class PokemonEnv(gym.Env):
                 self._milestone_step[i] = self._steps
 
     def _grab_frame(self, downscale: int | None = None) -> np.ndarray:
-        rgb = self.pyboy.screen.ndarray[:, :, :3].astype(np.uint16)
+        rgb = self.emulator.screen()
+        if rgb.shape[:2] != (SCREEN_HEIGHT, SCREEN_WIDTH):
+            rgb = _resize(rgb, SCREEN_HEIGHT, SCREEN_WIDTH)
+        rgb = rgb.astype(np.uint16)
         gray = (77 * rgb[..., 0] + 150 * rgb[..., 1] + 29 * rgb[..., 2]) >> 8
         k = self.config.downscale if downscale is None else downscale
         return gray[::k, ::k].astype(np.uint8)
@@ -311,6 +405,8 @@ class PokemonEnv(gym.Env):
         return np.stack(self._frames, axis=0)
 
     def _info(self, s: ProgressSignals, parts: dict[str, float]) -> dict[str, Any]:
+        stats = self.hub.stats() if self.hub is not None else {}
+        kind = self._spec["kind"]
         return {
             "map_id": s.map_id,
             "position": (s.x, s.y),
@@ -328,16 +424,23 @@ class PokemonEnv(gym.Env):
             "steps": self._steps,
             "milestone_step": self._milestone_step.copy(),
             # Episodes started from the archive do not count for the milestone curves.
-            "from_archive": self._from_archive,
-            "archive_cells": len(self.archive) if self.archive is not None else 0,
-            "from_demo": self._demo is not None,
-            "demos_active": len(self.curriculum) if self.curriculum is not None else 0,
-            "demos_completed": self.curriculum.completed if self.curriculum is not None else 0,
-            "demo_progress": self._demo.progress if self._demo is not None else 0.0,
+            "from_archive": kind == "archive",
+            "archive_cells": stats.get("archive_cells", 0),
+            "from_demo": kind == "demo",
+            "demos_active": stats.get("demos_active", 0),
+            "demos_completed": stats.get("demos_completed", 0),
+            "demo_progress": self._spec.get("progress", 0.0),
             "recording": self._last_recording,
             "goal_reached": self._goal_reached,
             "replay": self._last_replay,
         }
+
+
+def _resize(image: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Nearest-neighbour resize (fast, and enough to keep the screen readable)."""
+    rows = np.arange(height) * image.shape[0] // height
+    cols = np.arange(width) * image.shape[1] // width
+    return image[rows][:, cols]
 
 
 def _check_rom(rom_path: str, adapter: GameAdapter) -> None:

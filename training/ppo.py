@@ -39,7 +39,8 @@ from gymnasium.vector import AutoresetMode
 from highlights import Highlights
 from missingno_agents import build_network
 from missingno_envs import COMPONENTS, EnvConfig, PokemonEnv, RewardConfig
-from missingno_games import ADAPTERS, default_rom, default_state
+from missingno_envs.exploration import ExplorationHub
+from missingno_games import ADAPTERS, default_rom, default_state, goal_index
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
@@ -79,6 +80,12 @@ class Config:
     # Backward curriculum from the agent's own first-ever successes: probability that
     # an episode starts close to the end of a past success, then further back. Try 0.3.
     curriculum_prob: float = 0.0
+    # One archive and one curriculum for all the parallel games of a title, kept in
+    # this process and saved next to the checkpoints (exploration_<game>.pkl), so a
+    # new session continues with them. Off = each parallel game keeps its own, lost at
+    # every resume (the behaviour of runs before October 2026).
+    shared_exploration: bool = True
+    archive_max_cells: int = 5000
     # Self-imitation learning: replay the agent's best past actions (those that turned
     # out better than expected) so that rare successes are not forgotten. Try 1.0.
     sil_coef: float = 0.0
@@ -97,6 +104,15 @@ class Config:
     # is carrying Oak's Parcel). It learns what to remember over num_steps steps.
     memory: str = "none"
     memory_size: int = 256
+    # --- what the agent sees, and its eyes (the "v3" model: --downscale 1 --network impala)
+    # 2 = half resolution (80x72): fast, but the 8x8 letters become unreadable. 1 = the
+    # full Game Boy screen (160x144): the agent can read dialogues and menus.
+    downscale: int = 2
+    network: str = "atari"  # "atari" (3 convolutions) or "impala" (residual, deeper)
+    # Scale rewards by the running spread of the discounted return, so that the critic
+    # sees values of similar size whatever the reward version or the discount: needed
+    # with a long horizon (--gamma 0.999). Logged returns stay unscaled.
+    norm_rewards: bool = False
     # --- final goal
     # Stop training as soon as an episode from the start state reaches the last
     # milestone (for Red: the Boulder Badge). Its replay is saved in
@@ -104,6 +120,9 @@ class Config:
     # training stops when every game has been won at least once; the model at the
     # first win of each game is saved as checkpoints/winner_<game>.pt.
     stop_at_goal: bool = False
+    # The goal milestone, e.g. "M12" (first badge) or "M40" (the whole of Red).
+    # "" = the game's own goal for the current phase (Red: M12).
+    goal: str = ""
     # --- parallelism
     num_envs: int = 6  # parallel games: leave a core or two free for the OS
     num_steps: int = 256  # steps per game before each learning phase
@@ -172,12 +191,16 @@ def make_env(cfg: Config, index: int) -> gym.Env:
         max_steps=cfg.episode_steps,
         rewards=rewards,
         archive_prob=cfg.archive_prob,
+        archive_max_cells=cfg.archive_max_cells,
+        shared_exploration=cfg.shared_exploration,
+        goal=cfg.goal or None,
         archive_progress_weight=cfg.archive_progress_weight,
         curriculum_prob=cfg.curriculum_prob,
         record_every=cfg.record_every,
         record_dir=str(Path("runs") / cfg.run_name / "recordings"),
         record_tag=f"{game}_env{index}",
         stop_at_goal=cfg.stop_at_goal,
+        downscale=cfg.downscale,
         replay_dir=str(Path("runs") / cfg.run_name / "replays"),
     )
     if cfg.show and index == 0:
@@ -240,12 +263,14 @@ def train(cfg: Config) -> None:
         envs = gym.vector.AsyncVectorEnv(
             factories, autoreset_mode=AutoresetMode.SAME_STEP, context="spawn"
         )
+    vec = envs  # the bare vector env: call() and set_attr() reach the games
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
     milestones = {g: ADAPTERS[g].milestones for g in games}
 
     obs_shape = envs.single_observation_space.shape
     n_actions = envs.single_action_space.n
-    agent = build_network(obs_shape, n_actions, cfg.memory, cfg.memory_size).to(device)
+    agent = build_network(obs_shape, n_actions, cfg.memory, cfg.memory_size, cfg.network).to(device)
+    scaler = RewardScaler(cfg.num_envs, cfg.gamma) if cfg.norm_rewards else None
     recurrent = agent.recurrent
     if recurrent and cfg.num_envs % min(cfg.num_minibatches, cfg.num_envs):
         raise SystemExit("With --memory gru, --num-envs must be a multiple of --num-minibatches.")
@@ -299,12 +324,17 @@ def train(cfg: Config) -> None:
     # split across several sessions and continue as if it had never stopped.
     if cfg.resume:
         saved = torch.load(cfg.resume, map_location=device)
-        saved_memory = saved.get("config", {}).get("memory", "none")
-        if saved_memory != cfg.memory:
-            raise SystemExit(
-                f"The checkpoint was trained with --memory {saved_memory}, not {cfg.memory}: "
-                "a different network. Resume it with the same --memory."
-            )
+        defaults = {"memory": "none", "network": "atari", "downscale": 2}
+        for option, default in defaults.items():
+            was, now = saved.get("config", {}).get(option, default), getattr(cfg, option)
+            if was != now:
+                flag = "--" + option.replace("_", "-")
+                raise SystemExit(
+                    f"The checkpoint was trained with {flag} {was}, not {now}: a different "
+                    f"network. Resume it with {flag} {was}."
+                )
+        if scaler is not None and "reward_scaler" in saved:
+            scaler.load_state_dict(saved["reward_scaler"])
         agent.load_state_dict(saved["model"])
         if "optimizer" in saved:
             optimizer.load_state_dict(saved["optimizer"])
@@ -330,7 +360,49 @@ def train(cfg: Config) -> None:
     # purge_step drops any log entries written after the checkpoint by an interrupted session.
     writer = SummaryWriter(str(run_dir), purge_step=global_step if cfg.resume else None)
 
+    # Shared exploration: one hub per title (archive, curriculum, lineage), see exploration.py.
+    explore = cfg.shared_exploration and (cfg.archive_prob > 0 or cfg.curriculum_prob > 0)
+    hubs: dict[str, ExplorationHub] = {}
+    if explore:
+        for g in games:
+            hubs[g] = ExplorationHub(
+                archive_prob=cfg.archive_prob,
+                curriculum_prob=cfg.curriculum_prob,
+                archive_max_cells=cfg.archive_max_cells,
+                archive_progress_weight=cfg.archive_progress_weight,
+            )
+            saved_hub = Path(cfg.resume).parent / f"exploration_{g}.pkl" if cfg.resume else None
+            if saved_hub is not None and saved_hub.exists():
+                hubs[g].load(saved_hub)
+                st = hubs[g].stats()
+                print(
+                    f"Exploration of {g} restored: {st['archive_cells']} archived states, "
+                    f"{st['demos_active']} demos"
+                )
+    root_states, replay_meta = {}, {}
+    for i, (state, meta) in enumerate(
+        zip(vec.call("start_state"), vec.call("replay_meta"), strict=True)
+    ):
+        root_states.setdefault(env_games[i], state)
+        replay_meta.setdefault(env_games[i], meta)
+    rng = np.random.default_rng(cfg.seed)
+
+    def sync_exploration() -> None:
+        """Collect what every game found, hand out the next starting points."""
+        if not explore:
+            return
+        for i, report in enumerate(vec.call("drain")):
+            hubs[env_games[i]].absorb(report)
+        vec.set_attr("pending_starts", [hubs[g].starts(4, rng) for g in env_games])
+        vec.set_attr("known_maps", [set(hubs[g].maps_ever) for g in env_games])
+
+    def save_exploration() -> None:
+        for g, hub in hubs.items():
+            hub.save(run_dir / "checkpoints" / f"exploration_{g}.pkl")
+
     def save(path: Path, update: int) -> None:
+        if not path.name.startswith("step_"):
+            save_exploration()  # with latest.pt and the winners, not with every snapshot
         _save(
             path,
             agent,
@@ -342,6 +414,7 @@ def train(cfg: Config) -> None:
             update,
             best_reached,
             goals,
+            scaler,
         )
 
     print(
@@ -349,11 +422,13 @@ def train(cfg: Config) -> None:
         f"{num_updates} updates of {batch_size} steps, "
         f"device {device}, {cfg.torch_threads} torch threads, reward {cfg.reward_version}, "
         f"archive {cfg.archive_prob:.0%}, curriculum {cfg.curriculum_prob:.0%}, "
-        f"SIL {cfg.sil_coef}, memory {cfg.memory}, stop at goal: {cfg.stop_at_goal}, "
+        f"SIL {cfg.sil_coef}, memory {cfg.memory}, network {cfg.network}, "
+        f"screen 1/{cfg.downscale}, gamma {cfg.gamma}, stop at goal: {cfg.stop_at_goal}, "
         f"{sum(p.numel() for p in agent.parameters()):,} parameters"
     )
 
     next_obs, _ = envs.reset(seed=cfg.seed)
+    sync_exploration()  # after a resume, the restored archive is used from the first episodes
     next_obs = torch.as_tensor(next_obs, device=device)
     next_done = torch.zeros(cfg.num_envs, device=device)
     memory = agent.initial_state(cfg.num_envs, device) if recurrent else None
@@ -387,6 +462,9 @@ def train(cfg: Config) -> None:
                 act_buf[t], logp_buf[t], val_buf[t] = action, logp, value
 
                 obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+                done_now = np.logical_or(terminated, truncated)
+                if scaler is not None:
+                    reward = scaler(reward, done_now)
                 rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
                 # Simplification: a time-limit end is treated like a real end.
                 # Pokémon never "ends", so all our episodes end by time limit.
@@ -401,9 +479,25 @@ def train(cfg: Config) -> None:
                         game = env_games[i]
                         won = "goal_reached" in final and final["goal_reached"][i]
                         if won and game not in goals:
-                            goals[game] = (str(final["replay"][i]), global_step)
+                            replay = str(final["replay"][i])
+                            if not replay and game in hubs:
+                                # Shared mode: this process has the lineage, it writes the replay.
+                                report = final["goal_report"][i]
+                                replay = hubs[game].write_replay(
+                                    run_dir / "replays" / f"goal_{game}_step{global_step}.npz",
+                                    root_states[game],
+                                    report["node"],
+                                    report["actions"],
+                                    **replay_meta[game],
+                                )
+                            goals[game] = (replay, global_step)
                             _announce_goal(
-                                game, goals[game], milestones[game], multi, run_dir, update
+                                game,
+                                goals[game],
+                                milestones[game][goal_index(ADAPTERS[game], cfg.goal or None)],
+                                multi,
+                                run_dir,
+                                update,
                             )
                             if multi:
                                 save(run_dir / "checkpoints" / f"winner_{game}.pt", update)
@@ -418,6 +512,7 @@ def train(cfg: Config) -> None:
                             recent_milestones[game],
                             best_reached[game],
                             game if multi else "",
+                            local_stats=not explore,
                         )
                 all_won = cfg.stop_at_goal and len(goals) == len(games)
                 if all_won:
@@ -434,6 +529,12 @@ def train(cfg: Config) -> None:
             if highlights is not None:
                 for h in highlights.values():
                     h.maybe_flush(global_step)
+            sync_exploration()
+            for g, hub in hubs.items():
+                prefix = f"{g}/" if multi else ""
+                for name, value in hub.stats().items():
+                    section = "archive" if name.startswith(("archive", "lineage")) else "curriculum"
+                    writer.add_scalar(f"{section}/{prefix}{name}", value, global_step)
             t_learn = time.time()
 
             # ------------------------------------- 2. ADVANTAGES: how good was each action?
@@ -581,10 +682,10 @@ def _minibatches(agent, cfg, obs_buf, act_buf, done_buf, mem_buf, minibatch_size
         yield idx, logp.reshape(-1), entropy.reshape(-1), value.reshape(-1)
 
 
-def _announce_goal(game, goal, milestones, multi, run_dir, update) -> None:
+def _announce_goal(game, goal, milestone, multi, run_dir, update) -> None:
     replay, step = goal
     title = f"{game.upper()}: " if multi else ""
-    print(f"\n*** {title}FINAL GOAL REACHED at step {step:,}: {milestones[-1].name}! ***")
+    print(f"\n*** {title}FINAL GOAL REACHED at step {step:,}: {milestone.name}! ***")
     print(f"    replay: {replay}")
     print(f"    watch it: uv run python scripts/replay.py {replay}")
     if multi:
@@ -602,6 +703,38 @@ def _add_highlight(highlights, final, i, step) -> None:
     highlights.add(
         str(path), reached, int(final["maps_visited"][i]), int(final["tiles_visited"][i]), step
     )
+
+
+class RewardScaler:
+    """Divide rewards by the running standard deviation of the discounted return.
+
+    Like the usual "reward normalization" of PPO implementations, written out for our
+    setting: every episode ends by a time limit (all "dones" restart the return).
+    """
+
+    def __init__(self, n_envs: int, gamma: float, epsilon: float = 1e-8) -> None:
+        self.gamma, self.epsilon = gamma, epsilon
+        self.returns = np.zeros(n_envs)
+        self.count, self.mean, self.var = 1e-4, 0.0, 1.0
+
+    def __call__(self, reward: np.ndarray, done: np.ndarray) -> np.ndarray:
+        self.returns = self.returns * self.gamma + reward
+        self._update(self.returns)
+        self.returns[done] = 0.0
+        return reward / np.sqrt(self.var + self.epsilon)
+
+    def _update(self, x: np.ndarray) -> None:
+        batch_mean, batch_var, n = float(np.mean(x)), float(np.var(x)), len(x)
+        delta, total = batch_mean - self.mean, self.count + n
+        self.mean += delta * n / total
+        m2 = self.var * self.count + batch_var * n + delta**2 * self.count * n / total
+        self.var, self.count = m2 / total, total
+
+    def state_dict(self) -> dict:
+        return {"count": self.count, "mean": self.mean, "var": self.var}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.count, self.mean, self.var = state["count"], state["mean"], state["var"]
 
 
 class SelfImitationBuffer:
@@ -668,7 +801,9 @@ def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device):
     return better_frac, losses
 
 
-def _log_episode(writer, step, info, i, milestones, recent, best_reached, game="") -> int:
+def _log_episode(
+    writer, step, info, i, milestones, recent, best_reached, game="", local_stats=True
+) -> int:
     """Log one finished episode: return, exploration and milestones.
 
     With several titles, curves are kept per title: "episode/red/return", ...
@@ -678,9 +813,9 @@ def _log_episode(writer, step, info, i, milestones, recent, best_reached, game="
     def tag(section: str, name: str) -> str:
         return f"{section}/{game}/{name}" if game else f"{section}/{name}"
 
-    if "archive_cells" in final:
+    if local_stats and "archive_cells" in final:
         writer.add_scalar("archive/cells", float(final["archive_cells"][i]), step)
-    if "demos_active" in final:
+    if local_stats and "demos_active" in final:
         writer.add_scalar("curriculum/demos_active", float(final["demos_active"][i]), step)
         writer.add_scalar("curriculum/demos_completed", float(final["demos_completed"][i]), step)
     if "from_demo" in final and final["from_demo"][i]:
@@ -728,7 +863,17 @@ def _log_episode(writer, step, info, i, milestones, recent, best_reached, game="
 
 
 def _save(
-    path, agent, optimizer, cfg, obs_shape, n_actions, global_step, update, best_reached, goals
+    path,
+    agent,
+    optimizer,
+    cfg,
+    obs_shape,
+    n_actions,
+    global_step,
+    update,
+    best_reached,
+    goals,
+    scaler=None,
 ):
     """Everything needed both to watch the agent and to resume training."""
     torch.save(
@@ -742,6 +887,7 @@ def _save(
             "update": update,
             "best_reached": best_reached,
             "goals": goals,  # per title: (replay, step) of the first win
+            "reward_scaler": scaler.state_dict() if scaler is not None else None,
         },
         path,
     )

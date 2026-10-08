@@ -5,14 +5,16 @@ ROMs and save states are never committed (see roms/README.md and states/README.m
 
 from pathlib import Path
 
+GBA_GAMES = {"firered", "leafgreen", "ruby", "sapphire", "emerald"}
+
 
 def default_rom(game: str, folder: str = "roms") -> str:
-    """roms/pokemon_<game>.gb, or .gbc if that is the file you have."""
-    for ext in (".gb", ".gbc"):
+    """roms/pokemon_<game>.gb, .gbc or .gba: whichever file you have."""
+    for ext in (".gb", ".gbc", ".gba"):
         path = Path(folder) / f"pokemon_{game}{ext}"
         if path.exists():
             return str(path)
-    return str(Path(folder) / f"pokemon_{game}.gb")
+    return str(Path(folder) / f"pokemon_{game}{'.gba' if game in GBA_GAMES else '.gb'}")
 
 
 def default_state(game: str, folder: str = "states") -> str:

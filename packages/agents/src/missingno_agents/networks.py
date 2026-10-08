@@ -27,26 +27,65 @@ def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias: float = 0.0) -> 
     return layer
 
 
-class CnnActorCritic(nn.Module):
-    """A small CNN in the style of the classic Atari network (~1.1M parameters).
+def atari_encoder(frames: int) -> nn.Module:
+    """The classic Atari network's eyes (Mnih et al., 2015): three convolutions."""
+    return nn.Sequential(
+        layer_init(nn.Conv2d(frames, 32, kernel_size=8, stride=4)),
+        nn.ReLU(),
+        layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),
+        nn.ReLU(),
+        layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1)),
+        nn.ReLU(),
+        nn.Flatten(),
+    )
 
-    Input: (batch, frames, 72, 80) uint8. Output: action logits and a value.
+
+class _Residual(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv0 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.conv1(torch.relu(self.conv0(torch.relu(x))))
+
+
+def impala_encoder(frames: int, channels: tuple[int, ...] = (16, 32, 32)) -> nn.Module:
+    """The IMPALA network's eyes (Espeholt et al., 2018): convolutions, pooling and
+    residual blocks. Deeper than the Atari network, and it generalizes better to
+    levels never seen in training (Cobbe et al., Procgen, 2020)."""
+    layers: list[nn.Module] = []
+    in_channels = frames
+    for out in channels:
+        layers += [
+            nn.Conv2d(in_channels, out, kernel_size=3, padding=1),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            _Residual(out),
+            _Residual(out),
+        ]
+        in_channels = out
+    return nn.Sequential(*layers, nn.ReLU(), nn.Flatten())
+
+
+ENCODERS = {"atari": atari_encoder, "impala": impala_encoder}
+
+
+class CnnActorCritic(nn.Module):
+    """A CNN actor-critic: the eyes (`network`: "atari" ~1.1M parameters at 80x72, or
+    "impala"), one hidden layer, then the actor and the critic.
+
+    Input: (batch, frames, height, width) uint8. Output: action logits and a value.
     """
 
     recurrent = False
 
-    def __init__(self, obs_shape: tuple[int, int, int], n_actions: int) -> None:
+    def __init__(
+        self, obs_shape: tuple[int, int, int], n_actions: int, network: str = "atari"
+    ) -> None:
         super().__init__()
-        frames = obs_shape[0]
-        self.encoder = nn.Sequential(
-            layer_init(nn.Conv2d(frames, 32, kernel_size=8, stride=4)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),
-            nn.ReLU(),
-            layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1)),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
+        if network not in ENCODERS:
+            raise ValueError(f"Unknown network {network!r}: choose from {sorted(ENCODERS)}")
+        self.encoder = ENCODERS[network](obs_shape[0])
         with torch.no_grad():
             n_features = self.encoder(torch.zeros(1, *obs_shape)).shape[1]
         self.body = nn.Sequential(layer_init(nn.Linear(n_features, 512)), nn.ReLU())
@@ -85,9 +124,13 @@ class RecurrentActorCritic(CnnActorCritic):
     recurrent = True
 
     def __init__(
-        self, obs_shape: tuple[int, int, int], n_actions: int, memory_size: int = 256
+        self,
+        obs_shape: tuple[int, int, int],
+        n_actions: int,
+        memory_size: int = 256,
+        network: str = "atari",
     ) -> None:
-        super().__init__(obs_shape, n_actions)
+        super().__init__(obs_shape, n_actions, network)
         self.memory_size = memory_size
         self.memory = nn.GRU(512, memory_size)
         for name, param in self.memory.named_parameters():

@@ -12,12 +12,14 @@ import torch
 from missingno_agents.networks import CnnActorCritic, RecurrentActorCritic
 
 
-def build_network(obs_shape, n_actions: int, memory: str = "none", memory_size: int = 256):
-    """The network for a `--memory` option: "none" or "gru"."""
+def build_network(
+    obs_shape, n_actions: int, memory: str = "none", memory_size: int = 256, network: str = "atari"
+):
+    """The network for the `--memory` ("none", "gru") and `--network` ("atari", "impala") options."""
     if memory == "none":
-        return CnnActorCritic(obs_shape, n_actions)
+        return CnnActorCritic(obs_shape, n_actions, network)
     if memory == "gru":
-        return RecurrentActorCritic(obs_shape, n_actions, memory_size)
+        return RecurrentActorCritic(obs_shape, n_actions, memory_size, network)
     raise ValueError(f"Unknown memory {memory!r}: choose 'none' or 'gru'")
 
 
@@ -37,10 +39,13 @@ class Policy:
             data["n_actions"],
             self.memory,
             config.get("memory_size", 256),
+            config.get("network", "atari"),
         )
         self.net.load_state_dict(data["model"])
         self.net.eval()
         self.config = config
+        # The environment must show the screen the model was trained on (e.g. full resolution).
+        self.downscale = int(config.get("downscale", 2))
         self.greedy = greedy
         self.reset()
 

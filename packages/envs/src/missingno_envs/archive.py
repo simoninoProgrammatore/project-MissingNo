@@ -63,6 +63,7 @@ class _Entry:
     fast: float = 0.0  # moving averages of the returns of episodes started here
     slow: float = 0.0
     outcomes: int = 0
+    node: int = 0  # lineage node: how the agent got here from the start (exploration.py)
 
     @property
     def progress(self) -> float:
@@ -97,6 +98,22 @@ class StateArchive:
         self.cells[key] = _Entry(state=zlib.compress(save_state(), 1), visits=1)
         return True
 
+    def add(self, key: Cell, compressed_state: bytes, node: int = 0, visits: int = 1) -> bool:
+        """Store an already-compressed state for a new cell (shared archive). False if known/full."""
+        if key in self.cells:
+            self.cells[key].visits += visits
+            return False
+        if len(self.cells) >= self.max_cells:
+            self.visits_unarchived[key] = self.visits_unarchived.get(key, 0) + visits
+            return False
+        self.cells[key] = _Entry(state=compressed_state, visits=visits, node=node)
+        return True
+
+    def add_visits(self, key: Cell, n: int) -> None:
+        entry = self.cells.get(key)
+        if entry is not None:
+            entry.visits += n
+
     def record_outcome(self, key: Cell, episode_return: float) -> None:
         """Tell the archive how an episode started from `key` went."""
         entry = self.cells.get(key)
@@ -111,6 +128,15 @@ class StateArchive:
 
     def sample(self, rng: np.random.Generator) -> tuple[Cell, bytes]:
         """Pick a cell: frontier (chosen and visited less) plus learning progress."""
+        key, entry = self.sample_entry(rng)
+        return key, zlib.decompress(entry.state)
+
+    def sample_entry(self, rng: np.random.Generator, count: bool = True) -> tuple[Cell, _Entry]:
+        """Like `sample`, but returns the entry (compressed state, lineage node).
+
+        count=False: do not count it as chosen yet (the shared hub hands out starting
+        points in advance, and counts them when an episode reports back).
+        """
         keys = list(self.cells)
         entries = [self.cells[k] for k in keys]
         weights = np.array(
@@ -121,5 +147,6 @@ class StateArchive:
             weights = weights + self.progress_weight * progress / progress.max()
         key = keys[rng.choice(len(keys), p=weights / weights.sum())]
         entry = self.cells[key]
-        entry.chosen += 1
-        return key, zlib.decompress(entry.state)
+        if count:
+            entry.chosen += 1
+        return key, entry

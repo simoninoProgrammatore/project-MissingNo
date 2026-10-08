@@ -24,10 +24,13 @@ def load_policy(checkpoint: str, greedy: bool):
 
 
 def main(args) -> None:
+    policy = load_policy(args.checkpoint, args.greedy) if args.checkpoint else None
     config = EnvConfig(
         rom_path=args.rom,
         start_state_path=args.state,
         max_steps=args.steps,
+        # The screen the model was trained on (full or half resolution).
+        downscale=policy.downscale if policy else 2,
         # Never end the episode early: we want to see everything the agent does,
         # loops included (training stops them, see docs/rewards.md).
         rewards=RewardConfig.preset(args.reward_version).with_weights(
@@ -40,7 +43,6 @@ def main(args) -> None:
         render_mode=None if args.no_window else "human",
         emulation_speed=args.speed,
     )
-    policy = load_policy(args.checkpoint, args.greedy) if args.checkpoint else None
     milestones = env.adapter.milestones
 
     obs, info = env.reset(seed=0)
@@ -51,7 +53,7 @@ def main(args) -> None:
         action = policy(obs) if policy else env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         if args.gif and step % args.gif_every == 0:
-            frames.append(env.pyboy.screen.ndarray[:, :, :3].copy())
+            frames.append(env.emulator.screen().copy())
         total += reward
         if args.verbose and info["reward_parts"]:
             print(f"step {step:5d}  {ACTIONS[action]:>5}  +{reward:.2f}  {info['reward_parts']}")
@@ -83,7 +85,8 @@ def save_gif(frames, path: str, every: int) -> None:
     if not frames:
         print("No frames to save.")
         return
-    images = [Image.fromarray(f).resize((320, 288), Image.NEAREST) for f in frames]
+    h, w = frames[0].shape[:2]
+    images = [Image.fromarray(f).resize((w * 2, h * 2), Image.NEAREST) for f in frames]
     # 24 frames per step at 60 fps -> one agent step = 0.4 s of game time; play it 4x faster.
     duration_ms = max(20, int(every * 400 / 4))
     images[0].save(path, save_all=True, append_images=images[1:], duration=duration_ms, loop=0)
