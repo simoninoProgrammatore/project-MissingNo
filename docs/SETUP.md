@@ -47,8 +47,10 @@ uv run tensorboard --logdir runs
 # 2b. Or watch one of the games live while the agent learns (stop with Ctrl+C, not by closing the window)
 uv run python training/ppo.py --total-steps 1_000_000 --run-name smoke --show
 
-# 3. Watch the trained agent play
-uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt
+# 3. Watch the trained agent play. The terminal shows a live panel: reward of each
+#    component (total, times it paid, share), last rewards, milestones, team, Pokédex.
+#    --speed 1 is real time; --no-live prints plain lines instead.
+uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt --steps 40000 --speed 2
 
 # ...or save an episode as a GIF, without a window
 uv run python scripts/watch.py --checkpoint runs/smoke/checkpoints/latest.pt --no-window --steps 3000 --gif best.gif
