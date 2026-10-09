@@ -242,3 +242,21 @@ From scratch, reward v2.2, 30,000-step episodes, archive 30%, curriculum 30%, se
 - In `watch.py` every tile is worth its full value, because the panel starts with no visit counts. In training, tiles visited millions of times are worth almost nothing, so the panel overstates `new_tile`.
 - Kaggle shows the logs of a running version in bursts: hours without lines do not mean the run is stuck.
 - In the watched game the agent reached Viridian City in ~2,500 steps, then spent 5,000 steps battling in the grass instead of entering the Mart: battles pay a little, often; the Mart pays once.
+
+---
+
+## 2026-10-09 — The TPU machine, and playing while learning
+
+**What happened:**
+- The IMPALA "v3" model (`red_v3_s1`) is stopped after 4.3M steps: ~108 steps/s on the T4 (71% of the time learning), and slower per milestone too (Viridian City only, where the small network had Oak's Parcel at 480,000 steps). Decided: keep the small network, use the fast machine, and move to orchestrators (or a mixture of experts) only if it stalls.
+- Kaggle's TPU machine has **224 CPU cores and 330 GB of RAM**. We use only its CPU (`--device cpu`), the TPU stays idle. `badge_v22_s1` resumed there with 128 games: ~900 steps/s, ~1,100 with 16 threads for choosing buttons. About 30M steps per 8.5-hour session.
+- Bug found: resuming with more games stopped at once ("Done"), because the update counter came from the old batch size (37,397 updates of 1,024 steps) and was past the new last update (24,414 of 8,192). Now the counter is recomputed from the steps.
+
+**Learned (measured):**
+- Sending the per-step information between processes is negligible (0.01 ms per step).
+- Choosing the buttons of 128 games with one thread costs ~24 ms per step: more threads help.
+- The real ceiling on a CPU is learning: at ~2,400 steps/s it takes all the time. PufferLib (Pokémon RL's library, ~7,000 steps/s on a desktop with a GPU learner) cannot simply be dropped in: our shared exploration talks to the games with `call`/`set_attr`, and it would only speed up the playing half.
+
+**Done:**
+- `--async-learner`: the games play the next round while the network learns from the last one (one update behind, as in IMPALA and asynchronous PPO). Measured on a 2-core machine with a free core: 141 → 235 steps/s.
+- `--amp` (mixed precision on GPU, untested on a GPU yet), learning threads capped at 32 by default, settings for many-core machines in `docs/SETUP.md`.

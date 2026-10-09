@@ -27,6 +27,7 @@ import argparse
 import dataclasses
 import json
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -146,6 +147,9 @@ class Config:
     # --- logging and saving
     checkpoint_every: int = 50  # in learning updates
     device: str = "auto"  # "auto", "cpu" or "cuda"
+    # Mixed precision on a GPU: the network computes in 16-bit floats where it is safe
+    # (the T4's tensor cores), the weights stay 32-bit. Faster learning; no effect on CPU.
+    amp: bool = False
     # --- long runs split across sessions (e.g. Kaggle)
     resume: str = ""  # path to a checkpoint (.pt) to continue from
     time_limit_hours: float = 0.0  # stop cleanly and save after this many hours (0 = no limit)
@@ -153,9 +157,15 @@ class Config:
     # otherwise the emulators and the network fight for the CPU and everything slows down.
     torch_threads: int = 2
     # Threads while the network learns. The games wait during that phase, so on a CPU
-    # the cores they leave idle can all help the learning. 0 = all cores when training
-    # on the CPU, torch_threads on a GPU.
+    # the cores they leave idle can all help the learning. 0 = all cores (at most 32)
+    # when training on the CPU, torch_threads on a GPU.
     learn_threads: int = 0
+    # Play and learn at the same time (as in IMPALA / asynchronous PPO): while the
+    # network learns from the last round of games, the games already play the next
+    # round with the previous weights (one update behind; PPO's clipping handles it).
+    # Each round then costs max(play, learn) instead of play + learn. Worth it on
+    # machines with spare cores (e.g. Kaggle's TPU host); off by default.
+    async_learner: bool = False
 
 
 def game_list(cfg: Config) -> list[str]:
@@ -257,9 +267,20 @@ def train(cfg: Config) -> None:
     else:
         device = torch.device(cfg.device)
     torch.set_num_threads(cfg.torch_threads)
+    # Capped at 32: on machines with hundreds of cores (Kaggle's TPU host has 224),
+    # a small network spends more time coordinating threads than computing.
     learn_threads = cfg.learn_threads or (
-        (os.cpu_count() or 1) if device.type == "cpu" else cfg.torch_threads
+        min(os.cpu_count() or 1, 32) if device.type == "cpu" else cfg.torch_threads
     )
+    use_amp = cfg.amp and device.type == "cuda"
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # pick the fastest convolution for our shapes
+    # Mixed precision: autocast runs the forward pass in float16 where safe; the scaler
+    # keeps small gradients from vanishing in float16. Both do nothing when off.
+    amp_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    def autocast():
+        return torch.autocast("cuda", dtype=torch.float16, enabled=use_amp)
 
     # N games in parallel. SAME_STEP autoreset: when a game ends, the observation
     # we get back is already the first frame of the next episode, and the final
@@ -304,21 +325,30 @@ def train(cfg: Config) -> None:
     minibatch_size = batch_size // cfg.num_minibatches
     num_updates = cfg.total_steps // batch_size
 
-    # Buffers for one round of experience: (num_steps, num_envs, ...)
-    obs_buf = torch.zeros(
-        (cfg.num_steps, cfg.num_envs, *obs_shape), dtype=torch.uint8, device=device
-    )
-    act_buf = torch.zeros((cfg.num_steps, cfg.num_envs), dtype=torch.long, device=device)
-    logp_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-    rew_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-    done_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-    val_buf = torch.zeros((cfg.num_steps, cfg.num_envs), device=device)
-    # With memory: the memory state before each step (after the reset of a new episode).
-    mem_buf = (
-        torch.zeros((cfg.num_steps, cfg.num_envs, cfg.memory_size), device=device)
-        if recurrent
-        else None
-    )
+    # Buffers for one round of experience: (num_steps, num_envs, ...). With the
+    # asynchronous learner there are two sets: the games fill one while the network
+    # learns from the other.
+    def new_buffers() -> dict:
+        shape = (cfg.num_steps, cfg.num_envs)
+        return {
+            "obs": torch.zeros((*shape, *obs_shape), dtype=torch.uint8, device=device),
+            "act": torch.zeros(shape, dtype=torch.long, device=device),
+            "logp": torch.zeros(shape, device=device),
+            "rew": torch.zeros(shape, device=device),
+            "done": torch.zeros(shape, device=device),
+            "val": torch.zeros(shape, device=device),
+            # With memory: the memory state before each step (after the reset of a new episode).
+            "mem": torch.zeros((*shape, cfg.memory_size), device=device) if recurrent else None,
+        }
+
+    buffer_sets = [new_buffers() for _ in range(2 if cfg.async_learner else 1)]
+    # The network that plays. With the asynchronous learner it is a copy of `agent`,
+    # refreshed after every update, so the learner can change `agent` meanwhile.
+    actor = agent
+    if cfg.async_learner:
+        actor = build_network(obs_shape, n_actions, cfg.memory, cfg.memory_size, cfg.network)
+        actor = actor.to(device)
+        actor.requires_grad_(False)
 
     # Rolling statistics over the last finished episodes, per title, for the logs.
     recent_milestones = {g: deque(maxlen=50) for g in games}
@@ -347,7 +377,12 @@ def train(cfg: Config) -> None:
         if "optimizer" in saved:
             optimizer.load_state_dict(saved["optimizer"])
         global_step = saved.get("global_step", 0)
-        first_update = saved.get("update", 0) + 1
+        # Count updates from the steps already done, in this session's batch size: a
+        # run resumed with more (or fewer) parallel games keeps its place in the
+        # learning-rate schedule instead of finding itself past the last update.
+        first_update = global_step // batch_size + 1
+        if global_step < num_updates * batch_size and first_update > num_updates:
+            first_update = num_updates
         saved_best = saved.get("best_reached", 0)
         if isinstance(saved_best, int):  # checkpoints from single-game runs
             saved_best = {saved.get("config", {}).get("game", games[0]): saved_best}
@@ -431,54 +466,141 @@ def train(cfg: Config) -> None:
         f"device {device}, {cfg.torch_threads} torch threads ({learn_threads} while learning), reward {cfg.reward_version}, "
         f"archive {cfg.archive_prob:.0%}, curriculum {cfg.curriculum_prob:.0%}, "
         f"SIL {cfg.sil_coef}, memory {cfg.memory}, network {cfg.network}, "
+        f"learner {'asynchronous' if cfg.async_learner else 'synchronous'}, "
+        f"mixed precision {'on' if use_amp else 'off'}, "
+        f"{cfg.update_epochs} epochs x {cfg.num_minibatches} minibatches, "
+        f"mixed precision {'on' if use_amp else 'off'}, "
         f"screen 1/{cfg.downscale}, gamma {cfg.gamma}, stop at goal: {cfg.stop_at_goal}, "
         f"{sum(p.numel() for p in agent.parameters()):,} parameters"
     )
 
+    if actor is not agent:
+        actor.load_state_dict(agent.state_dict())  # after a resume: the restored weights
     next_obs, _ = envs.reset(seed=cfg.seed)
     sync_exploration()  # after a resume, the restored archive is used from the first episodes
     next_obs = torch.as_tensor(next_obs, device=device)
     next_done = torch.zeros(cfg.num_envs, device=device)
-    memory = agent.initial_state(cfg.num_envs, device) if recurrent else None
+    memory = actor.initial_state(cfg.num_envs, device) if recurrent else None
     start, start_step = time.time(), global_step
     deadline = start + cfg.time_limit_hours * 3600 if cfg.time_limit_hours > 0 else None
     completed = first_update - 1  # last fully completed update
+    completed_step = global_step  # steps at the end of that update
+
+    def learn(buf: dict) -> dict:
+        """Advantages are in buf; learn from them. Runs in a thread if asynchronous."""
+        torch.set_num_threads(learn_threads)  # the cores the games leave free
+        b_obs = buf["obs"].reshape((-1, *obs_shape))
+        b_act, b_logp = buf["act"].reshape(-1), buf["logp"].reshape(-1)
+        b_adv, b_ret = buf["adv"].reshape(-1), buf["ret"].reshape(-1)
+        b_val = buf["val"].reshape(-1)
+
+        clipfracs = []
+        for _ in range(cfg.update_epochs):
+            batches = _minibatches(
+                agent, cfg, buf["obs"], buf["act"], buf["done"], buf["mem"], minibatch_size, device
+            )
+            while True:
+                # Forward pass and loss under autocast (mixed precision, if on);
+                # the backward pass outside it, as PyTorch recommends.
+                with autocast():
+                    batch = next(batches, None)
+                    if batch is None:
+                        break
+                    idx, new_logp, entropy, new_value = batch
+                    loss, pg_loss, v_loss, ent_loss, clipfrac = _ppo_loss(
+                        cfg, new_logp, entropy, new_value, b_logp[idx], b_adv[idx], b_ret[idx]
+                    )
+                clipfracs.append(clipfrac)
+                optimizer.zero_grad()
+                amp_scaler.scale(loss).backward()
+                amp_scaler.unscale_(optimizer)  # clip the true gradients, not scaled ones
+                nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
+                amp_scaler.step(optimizer)
+                amp_scaler.update()
+
+        # Self-imitation (optional): keep the actions that turned out much better than
+        # expected, and keep practicing them later, so a rare success is not forgotten.
+        sil_stats = None
+        if sil is not None:
+            k = max(1, int(cfg.sil_store_frac * batch_size))
+            best = torch.topk(b_adv, k).indices
+            best = best[b_adv[best] > 0]
+            b_mem = buf["mem"].reshape(batch_size, -1)[best] if recurrent else None
+            sil.add(b_obs[best], b_act[best], b_ret[best], b_mem)
+            sil_stats = _sil_update(
+                agent, optimizer, sil, cfg, minibatch_size, device, autocast, amp_scaler
+            )
+        return {
+            "policy": pg_loss.item(),
+            "value": v_loss.item(),
+            "entropy": ent_loss.item(),
+            "clipfrac": float(np.mean(clipfracs)),
+            "explained_variance": (1 - torch.var(b_ret - b_val) / (torch.var(b_ret) + 1e-8)).item(),
+            "sil": sil_stats,
+        }
+
+    learner: dict = {}  # the running learner thread and its result, when asynchronous
+
+    def wait_for_learner() -> dict | None:
+        """Wait for the update in progress (if any); then the games get its weights."""
+        thread = learner.pop("thread", None)
+        if thread is None:
+            return None
+        thread.join()
+        if "error" in learner:
+            raise learner.pop("error")
+        if actor is not agent:
+            actor.load_state_dict(agent.state_dict())
+        return learner.pop("stats")
+
+    def run_learner(buf: dict) -> None:
+        try:
+            learner["stats"] = learn(buf)
+        except BaseException as e:  # re-raised in the main thread by wait_for_learner
+            learner["error"] = e
+
+    def log_update(stats: dict | None, step: int) -> None:
+        if stats is None:
+            return
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], step)
+        for name in ("policy", "value", "entropy", "clipfrac", "explained_variance"):
+            writer.add_scalar(f"losses/{name}", stats[name], step)
+        if sil is not None:
+            writer.add_scalar("sil/buffer", len(sil), step)
+            if stats["sil"]:
+                writer.add_scalar("sil/still_better_frac", stats["sil"][0], step)
+                writer.add_scalar("sil/loss", stats["sil"][1], step)
 
     all_won = False
     try:
         play_time = learn_time = 0.0
         for update in range(first_update, num_updates + 1):
+            buf = buffer_sets[update % len(buffer_sets)]
             t_play = time.time()
-            if cfg.anneal_lr:
-                optimizer.param_groups[0]["lr"] = cfg.learning_rate * (
-                    1 - (update - 1) / num_updates
-                )
 
             # ------------------------------------------------------------- 1. PLAY
             for t in range(cfg.num_steps):
                 global_step += cfg.num_envs
-                obs_buf[t] = next_obs
-                done_buf[t] = next_done
+                buf["obs"][t] = next_obs
+                buf["done"][t] = next_done
                 with torch.inference_mode():
                     if recurrent:
                         # A game that just ended starts a new episode: wipe its memory.
                         memory = memory * (1.0 - next_done).unsqueeze(-1)
-                        mem_buf[t] = memory
-                        action, logp, _, value, memory = agent.act(next_obs, memory)
+                        buf["mem"][t] = memory
+                        action, logp, _, value, memory = actor.act(next_obs, memory)
                     else:
-                        action, logp, _, value = agent.act(next_obs)
-                act_buf[t], logp_buf[t], val_buf[t] = action, logp, value
+                        action, logp, _, value = actor.act(next_obs)
+                buf["act"][t], buf["logp"][t], buf["val"][t] = action, logp, value
 
                 obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
                 done_now = np.logical_or(terminated, truncated)
                 if scaler is not None:
                     reward = scaler(reward, done_now)
-                rew_buf[t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
+                buf["rew"][t] = torch.as_tensor(reward, device=device, dtype=torch.float32)
                 # Simplification: a time-limit end is treated like a real end.
                 # Pokémon never "ends", so all our episodes end by time limit.
-                next_done = torch.as_tensor(
-                    np.logical_or(terminated, truncated), device=device, dtype=torch.float32
-                )
+                next_done = torch.as_tensor(done_now, device=device, dtype=torch.float32)
                 next_obs = torch.as_tensor(obs, device=device)
 
                 if "final_info" in info:
@@ -508,6 +630,7 @@ def train(cfg: Config) -> None:
                                 update,
                             )
                             if multi:
+                                log_update(wait_for_learner(), global_step)
                                 save(run_dir / "checkpoints" / f"winner_{game}.pt", update)
                         if highlights is not None:
                             _add_highlight(highlights[game], final, i, global_step)
@@ -528,6 +651,7 @@ def train(cfg: Config) -> None:
 
             play_time += time.time() - t_play
             if all_won:
+                log_update(wait_for_learner(), global_step)
                 save(run_dir / "checkpoints" / "winner.pt", update)
                 save(run_dir / "checkpoints" / "latest.pt", update)
                 won = ", ".join(f"{g} at step {goals[g][1]:,}" for g in games)
@@ -544,93 +668,49 @@ def train(cfg: Config) -> None:
                     section = "archive" if name.startswith(("archive", "lineage")) else "curriculum"
                     writer.add_scalar(f"{section}/{prefix}{name}", value, global_step)
             t_learn = time.time()
-            torch.set_num_threads(learn_threads)  # the games are waiting: use every core
 
             # ------------------------------------- 2. ADVANTAGES: how good was each action?
             # GAE: compare what actually happened (rewards) with what the critic
-            # expected (values). Positive advantage = better than expected.
+            # expected (values). Positive advantage = better than expected. The critic
+            # here is the one that played, the same that gave the values in the buffer.
             with torch.no_grad():
                 if recurrent:
-                    next_value = agent.value(next_obs, memory, next_done)
+                    next_value = actor.value(next_obs, memory, next_done)
                 else:
-                    next_value = agent.value(next_obs)
-                advantages = torch.zeros_like(rew_buf)
+                    next_value = actor.value(next_obs)
+                advantages = torch.zeros_like(buf["rew"])
                 last_gae = torch.zeros(cfg.num_envs, device=device)
                 for t in reversed(range(cfg.num_steps)):
                     if t == cfg.num_steps - 1:
                         not_done, next_val = 1.0 - next_done, next_value
                     else:
-                        not_done, next_val = 1.0 - done_buf[t + 1], val_buf[t + 1]
-                    delta = rew_buf[t] + cfg.gamma * next_val * not_done - val_buf[t]
+                        not_done, next_val = 1.0 - buf["done"][t + 1], buf["val"][t + 1]
+                    delta = buf["rew"][t] + cfg.gamma * next_val * not_done - buf["val"][t]
                     last_gae = delta + cfg.gamma * cfg.gae_lambda * not_done * last_gae
                     advantages[t] = last_gae
-                returns = advantages + val_buf
+                buf["adv"], buf["ret"] = advantages, advantages + buf["val"]
 
             # ----------------------------------------------------------- 3. LEARN
-            b_obs = obs_buf.reshape((-1, *obs_shape))
-            b_act, b_logp = act_buf.reshape(-1), logp_buf.reshape(-1)
-            b_adv, b_ret, b_val = advantages.reshape(-1), returns.reshape(-1), val_buf.reshape(-1)
-
-            clipfracs = []
-            for _ in range(cfg.update_epochs):
-                for idx, new_logp, entropy, new_value in _minibatches(
-                    agent, cfg, obs_buf, act_buf, done_buf, mem_buf, minibatch_size, device
-                ):
-                    ratio = (new_logp - b_logp[idx]).exp()  # new policy / old policy
-                    with torch.no_grad():
-                        clipfracs.append(((ratio - 1).abs() > cfg.clip_coef).float().mean().item())
-
-                    adv = b_adv[idx]
-                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-                    # Policy loss: push up actions with positive advantage, but clip the
-                    # ratio so one update cannot change the policy too much.
-                    pg_loss = torch.max(
-                        -adv * ratio, -adv * ratio.clamp(1 - cfg.clip_coef, 1 + cfg.clip_coef)
-                    ).mean()
-                    # Value loss: teach the critic to predict the actual returns.
-                    v_loss = 0.5 * ((new_value - b_ret[idx]) ** 2).mean()
-                    # Entropy bonus: keep some randomness, so the agent keeps exploring.
-                    ent_loss = entropy.mean()
-
-                    loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent_loss
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
-                    optimizer.step()
-
-            # ------------------------------------------- 4. SELF-IMITATION (optional)
-            # Keep the actions that turned out much better than expected, and keep
-            # practicing them later: a rare success (e.g. leaving the lab once) is
-            # not forgotten after one update.
-            sil_stats = None
-            if sil is not None:
-                k = max(1, int(cfg.sil_store_frac * batch_size))
-                best = torch.topk(b_adv, k).indices
-                best = best[b_adv[best] > 0]
-                b_mem = mem_buf.reshape(batch_size, -1)[best] if recurrent else None
-                sil.add(b_obs[best], b_act[best], b_ret[best], b_mem)
-                sil_stats = _sil_update(agent, optimizer, sil, cfg, minibatch_size, device)
-
-            torch.set_num_threads(cfg.torch_threads)  # back to sharing the cores with the games
+            # Synchronous: learn now, the games wait. Asynchronous: wait for the
+            # previous update, hand its weights to the games, start this one in the
+            # background, and go back to playing.
+            prev_stats = wait_for_learner()
+            if cfg.anneal_lr:
+                optimizer.param_groups[0]["lr"] = cfg.learning_rate * (
+                    1 - (update - 1) / num_updates
+                )
+            if cfg.async_learner:
+                log_update(prev_stats, global_step)
+                learner["thread"] = threading.Thread(target=run_learner, args=(buf,), daemon=True)
+                learner["thread"].start()
+            else:
+                log_update(learn(buf), global_step)
+                torch.set_num_threads(cfg.torch_threads)  # back to sharing the cores
             learn_time += time.time() - t_learn
 
             # ------------------------------------------------------------- logging
             sps = int((global_step - start_step) / (time.time() - start))
-            explained_var = 1 - torch.var(b_ret - b_val) / (torch.var(b_ret) + 1e-8)
-            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
             writer.add_scalar("charts/SPS", sps, global_step)
-            writer.add_scalar("losses/policy", pg_loss.item(), global_step)
-            writer.add_scalar("losses/value", v_loss.item(), global_step)
-            writer.add_scalar("losses/entropy", ent_loss.item(), global_step)
-            writer.add_scalar("losses/clipfrac", float(np.mean(clipfracs)), global_step)
-            writer.add_scalar("losses/explained_variance", explained_var.item(), global_step)
-            if sil is not None:
-                writer.add_scalar("sil/buffer", len(sil), global_step)
-                if sil_stats:
-                    writer.add_scalar("sil/still_better_frac", sil_stats[0], global_step)
-                    writer.add_scalar("sil/loss", sil_stats[1], global_step)
-
             if update % 10 == 0 or update == num_updates:
                 share = play_time / (play_time + learn_time)
                 best = ", ".join(
@@ -641,20 +721,30 @@ def train(cfg: Config) -> None:
                     f"update {update}/{num_updates}  steps {global_step:,}  SPS {sps}  "
                     f"(playing {share:.0%} of the time)  best milestones {best}"
                 )
-            completed = update
-            if update % cfg.checkpoint_every == 0 or update == num_updates:
+            save_now = update % cfg.checkpoint_every == 0 or update == num_updates
+            stop_now = bool(deadline and time.time() > deadline)
+            if save_now or stop_now:
+                # A checkpoint must not catch the learner halfway: let it finish first.
+                log_update(wait_for_learner(), global_step)
+            completed, completed_step = update, global_step
+            if save_now:
                 save(run_dir / "checkpoints" / f"step_{global_step}.pt", update)
                 save(run_dir / "checkpoints" / "latest.pt", update)
-            if deadline and time.time() > deadline:
+            if stop_now:
                 print(f"Time limit of {cfg.time_limit_hours} h reached: saving and stopping.")
                 save(run_dir / "checkpoints" / "latest.pt", update)
                 print(f"Resume with: --resume {run_dir / 'checkpoints' / 'latest.pt'}")
                 break
+        else:
+            log_update(wait_for_learner(), global_step)
 
     except KeyboardInterrupt:
         # Ctrl+C: save what we have, so the run can still be watched or resumed.
-        # The experience of the interrupted update is discarded: we save the last complete one.
-        global_step = completed * batch_size
+        # The experience of the interrupted round is discarded: we save the last complete one.
+        if "thread" in learner:
+            learner["thread"].join()  # an update in progress finishes, then is saved
+            learner.clear()
+        global_step = completed_step
         print(f"\nInterrupted: saving the model at step {global_step:,} (last complete update)...")
         save(run_dir / "checkpoints" / "latest.pt", completed)
 
@@ -778,7 +868,26 @@ class SelfImitationBuffer:
         return self.obs[idx], self.act[idx], self.ret[idx], mem
 
 
-def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device):
+def _ppo_loss(cfg, new_logp, entropy, new_value, old_logp, adv, ret):
+    """The PPO loss of one minibatch, and the fraction of clipped ratios."""
+    ratio = (new_logp - old_logp).exp()  # new policy / old policy
+    with torch.no_grad():
+        clipfrac = ((ratio - 1).abs() > cfg.clip_coef).float().mean().item()
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    # Policy loss: push up actions with positive advantage, but clip the
+    # ratio so one update cannot change the policy too much.
+    pg_loss = torch.max(
+        -adv * ratio, -adv * ratio.clamp(1 - cfg.clip_coef, 1 + cfg.clip_coef)
+    ).mean()
+    # Value loss: teach the critic to predict the actual returns.
+    v_loss = 0.5 * ((new_value.float() - ret) ** 2).mean()
+    # Entropy bonus: keep some randomness, so the agent keeps exploring.
+    ent_loss = entropy.mean()
+    loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent_loss
+    return loss, pg_loss, v_loss, ent_loss, clipfrac
+
+
+def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device, autocast, scaler):
     """Self-imitation learning (Oh et al., 2018).
 
     For each replayed action, compare the return it led to with what the critic
@@ -792,20 +901,23 @@ def _sil_update(agent, optimizer, sil, cfg, minibatch_size, device):
     for _ in range(cfg.sil_updates):
         obs, act, ret, mem = sil.sample(minibatch_size)
         obs, act, ret = obs.to(device), act.to(device), ret.to(device)
-        if agent.recurrent:
-            # The stored memory is the one the agent had back then: an approximation
-            # (the network has changed since), the usual one for replayed experience.
-            _, logp, _, value, _ = agent.act(obs, mem.to(device), action=act)
-        else:
-            _, logp, _, value = agent.act(obs, act)
-        gap = (ret - value).clamp(min=0)  # how much better than expected, 0 if not
-        policy_loss = -(logp * gap.detach()).mean()
-        value_loss = 0.5 * (gap**2).mean()
-        loss = cfg.sil_coef * (policy_loss + cfg.sil_value_coef * value_loss)
+        with autocast():
+            if agent.recurrent:
+                # The stored memory is the one the agent had back then: an approximation
+                # (the network has changed since), the usual one for replayed experience.
+                _, logp, _, value, _ = agent.act(obs, mem.to(device), action=act)
+            else:
+                _, logp, _, value = agent.act(obs, act)
+            gap = (ret - value.float()).clamp(min=0)  # how much better than expected, 0 if not
+            policy_loss = -(logp * gap.detach()).mean()
+            value_loss = 0.5 * (gap**2).mean()
+            loss = cfg.sil_coef * (policy_loss + cfg.sil_value_coef * value_loss)
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(agent.parameters(), cfg.max_grad_norm)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         better_frac += (gap > 0).float().mean().item() / cfg.sil_updates
         losses += loss.item() / cfg.sil_updates
     return better_frac, losses

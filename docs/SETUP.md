@@ -132,6 +132,22 @@ PyTorch from PyPI runs on the CPU on Windows, which is fine for this small netwo
 - **Resume** a run from its last checkpoint: `--resume runs/<run-name>/checkpoints/latest.pt` (keep the same `--run-name`).
 - **Stop cleanly** after a number of hours, saving everything: `--time-limit-hours 11`.
 - `Ctrl+C` also saves the last complete update.
+- A run can be resumed with a different `--num-envs` or `--num-steps`: the update counter is recomputed from the steps already done.
+
+### Many cores (e.g. Kaggle's TPU machine: 224 cores, used as a CPU)
+
+Each round has two phases: the games play, then the network learns. Settings for a machine with many cores, the small network, CPU only:
+
+```
+--device cpu --num-envs 128 --num-steps 128 --num-minibatches 16
+--torch-threads 16 --learn-threads 32 --async-learner
+```
+
+- `--num-envs 128`: games in parallel. With many games, shorter rounds (`--num-steps 128`) and more minibatches (`--num-minibatches 16`) keep the network updating often enough.
+- `--torch-threads 16`: threads for choosing the buttons of all games at every step (one thread was a bottleneck with 128 games).
+- `--learn-threads 32`: threads while learning (default: all cores, at most 32).
+- `--async-learner`: the games play the next round while the network learns from the last one, with the weights of one update before (PPO's clipping handles that). A round then costs the slower of the two phases instead of their sum. On a 2-core test with a free core for the learner: 141 → 235 steps/s. Useless when no core is free.
+- `--amp`: mixed precision on a GPU (16-bit where safe). No effect on CPU.
 
 ### Kaggle
 
