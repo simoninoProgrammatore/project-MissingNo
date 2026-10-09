@@ -227,3 +227,18 @@ From scratch, reward v2.2, 30,000-step episodes, archive 30%, curriculum 30%, se
 - Honest assessment: the small network can plausibly reach the first badge; the whole game needs memory and a larger network, whatever the number of steps.
 
 **Decided:** brute force is not the plan. The whole of Red is estimated at 10–50B steps, years on Kaggle and up to a whole ISCRA-C allocation. Written down in `docs/research.md` (§6.2, "Making every step count"): three levers that raise what each step is worth, each with its test. They are: splitting the game through the agent's own states (Go-Explore, already built), a world model (DreamerV3, a research branch), and more steps per second. Memory is a prerequisite, not a lever. This is also the skeleton of the ISCRA-C application.
+
+---
+
+## 2026-10-09 — Watching the rewards, and the CPU speed
+
+**Done:**
+- `watch.py` shows a live panel in the terminal: the reward of each component (total, how many times it paid, share of the return), the last rewards, the milestones and the next one, team, badges and Pokédex.
+- The Kaggle notebook runs on CPU-only sessions (it no longer needs `nvidia-smi`).
+- On a CPU, the network now learns with every core (`--learn-threads`, default: all cores on CPU). The games wait while the network learns, so their cores were idle.
+
+**Learned:**
+- The 464 steps/s session of `badge_v22_s1` ran with a GPU, not on CPU as I thought. On a real CPU-only session the small network does ~150 steps/s and spends ~60% of the time learning on one thread. With all cores while learning, the estimate is ~1.5x faster (measured +15% on a 2-core machine).
+- In `watch.py` every tile is worth its full value, because the panel starts with no visit counts. In training, tiles visited millions of times are worth almost nothing, so the panel overstates `new_tile`.
+- Kaggle shows the logs of a running version in bursts: hours without lines do not mean the run is stuck.
+- In the watched game the agent reached Viridian City in ~2,500 steps, then spent 5,000 steps battling in the grass instead of entering the Mart: battles pay a little, often; the Mart pays once.

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -151,6 +152,10 @@ class Config:
     # CPU threads for PyTorch. Keep num_envs + torch_threads <= your logical cores,
     # otherwise the emulators and the network fight for the CPU and everything slows down.
     torch_threads: int = 2
+    # Threads while the network learns. The games wait during that phase, so on a CPU
+    # the cores they leave idle can all help the learning. 0 = all cores when training
+    # on the CPU, torch_threads on a GPU.
+    learn_threads: int = 0
 
 
 def game_list(cfg: Config) -> list[str]:
@@ -252,6 +257,9 @@ def train(cfg: Config) -> None:
     else:
         device = torch.device(cfg.device)
     torch.set_num_threads(cfg.torch_threads)
+    learn_threads = cfg.learn_threads or (
+        (os.cpu_count() or 1) if device.type == "cpu" else cfg.torch_threads
+    )
 
     # N games in parallel. SAME_STEP autoreset: when a game ends, the observation
     # we get back is already the first frame of the next episode, and the final
@@ -420,7 +428,7 @@ def train(cfg: Config) -> None:
     print(
         f"Run '{cfg.run_name}': {cfg.num_envs} games ({', '.join(env_games)}), "
         f"{num_updates} updates of {batch_size} steps, "
-        f"device {device}, {cfg.torch_threads} torch threads, reward {cfg.reward_version}, "
+        f"device {device}, {cfg.torch_threads} torch threads ({learn_threads} while learning), reward {cfg.reward_version}, "
         f"archive {cfg.archive_prob:.0%}, curriculum {cfg.curriculum_prob:.0%}, "
         f"SIL {cfg.sil_coef}, memory {cfg.memory}, network {cfg.network}, "
         f"screen 1/{cfg.downscale}, gamma {cfg.gamma}, stop at goal: {cfg.stop_at_goal}, "
@@ -536,6 +544,7 @@ def train(cfg: Config) -> None:
                     section = "archive" if name.startswith(("archive", "lineage")) else "curriculum"
                     writer.add_scalar(f"{section}/{prefix}{name}", value, global_step)
             t_learn = time.time()
+            torch.set_num_threads(learn_threads)  # the games are waiting: use every core
 
             # ------------------------------------- 2. ADVANTAGES: how good was each action?
             # GAE: compare what actually happened (rewards) with what the critic
@@ -603,6 +612,7 @@ def train(cfg: Config) -> None:
                 sil.add(b_obs[best], b_act[best], b_ret[best], b_mem)
                 sil_stats = _sil_update(agent, optimizer, sil, cfg, minibatch_size, device)
 
+            torch.set_num_threads(cfg.torch_threads)  # back to sharing the cores with the games
             learn_time += time.time() - t_learn
 
             # ------------------------------------------------------------- logging
